@@ -25,8 +25,8 @@ npm install
 npm run dev
 ```
 
-- 前端（Vite）：http://localhost:5173
-- 行情代理（Express）：http://localhost:8787，开发时由 Vite 代理 `/api`
+- 前端（Vite）：<http://localhost:5173>
+- 行情代理（Express）：<http://localhost:8787>，开发时由 Vite 代理 `/api`
 
 生产构建与运行：
 
@@ -35,7 +35,7 @@ npm run build
 npm start
 ```
 
-构建后由 Express 同时提供静态页面与 API，默认访问 http://localhost:8787。
+构建后由 Express 同时提供静态页面与 API，默认访问 <http://localhost:8787>。
 
 ### 环境变量
 
@@ -81,6 +81,8 @@ Express 行情代理（内存快照 + 30s 分时缓存 + 限流 + 安全响应�
 新浪财经 → 东方财富 / 京东金融 → gold-api.com / open.er-api.com
 ```
 
+> 部署到云端时，Express 层由 `worker/` 的 Cloudflare Worker 承担（内存快照 + 4s TTL，SSE 换成前端轮询），前端走 GitHub Pages 静态托管，详见下文「部署」。
+
 - `shared/`：前后端共享的品种元数据与类型。
 - `server/`：Express 服务、数据源适配器、行情聚合与降级逻辑。
 - `src/`：React 界面、SSE 数据层、提醒引擎、自绘 SVG 分时图与样式令牌。
@@ -97,6 +99,23 @@ Express 行情代理（内存快照 + 30s 分时缓存 + 限流 + 安全响应�
 
 服务端限制：每 IP 每分钟 180 次请求、最多 80 个 SSE 连接、上游请求 8 秒超时。浏览器端使用严格的 CSP、`X-Frame-Options: DENY`、`nosniff` 等安全响应头。
 
+## 部署（PWA + 无服务器）
+
+手机使用的推荐路径：前端静态托管在 GitHub Pages，行情 API 部署为 Cloudflare Worker 并绑定自定义域名（`*.workers.dev` 默认域名在国内被 DNS 污染，不可直接用），手机浏览器「添加到主屏幕」后全屏运行（PWA）。
+
+快速流程（详细步骤见 [docs/DEPLOY.md](docs/DEPLOY.md)，踩坑记录见 [docs/DEPLOY-NOTES.md](docs/DEPLOY-NOTES.md)）：
+
+```bash
+npm run deploy:api   # 1. 部署 Worker（wrangler，首次需 npx wrangler login）
+npm run deploy:web   # 2. 构建并推送 gh-pages 分支（需 .env.production 里配置 VITE_API_BASE）
+```
+
+然后在仓库 Settings → Pages 选择 `gh-pages` 分支。
+
+### 本地模式不变
+
+`npm run dev` / `npm start` 仍是 Express 本地服务，行为与改造前一致（SSE + Vite 代理）。
+
 ## 测试
 
 ```bash
@@ -108,7 +127,9 @@ npm run build
 ## 目录
 
 ```
-docs/              项目截图
+docs/              项目截图、部署 SOP（DEPLOY.md）与踩坑记录（DEPLOY-NOTES.md）
+public/            PWA 清单、Service Worker、应用图标
+worker/            Cloudflare Worker 无服务器行情 API
 server/            Express API、行情源与聚合
 shared/            品种与数据类型
 src/components/    界面组件（卡片、图表、面板、设置）

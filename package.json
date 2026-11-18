@@ -14,7 +14,9 @@
     "build": "npm run typecheck && npm run build:web && npm run build:api",
     "build:web": "vite build",
     "build:api": "tsc -p tsconfig.server.json",
-    "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.server.json --noEmit",
+    "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.server.json --noEmit && tsc -p tsconfig.worker.json --noEmit",
+    "deploy:api": "npx wrangler deploy",
+    "deploy:web": "npm run build:web && npx gh-pages -d dist",
     "test": "vitest run",
     "start": "node dist-server/server/index.js",
     "preview": "npm run build && npm start"
@@ -31,9 +33,11 @@
     "@types/react-dom": "^19.3.0",
     "@vitejs/plugin-react": "^6.3.0",
     "concurrently": "^10.0.7",
+    "gh-pages": "^6.3.0",
     "tsx": "^4.23.15",
     "typescript": "^7.0.2",
     "vite": "^8.3.8",
-    "vitest": "^5.1.0"
+    "vitest": "^5.1.0",
+    "wrangler": "^4.164.0"
   }
 }

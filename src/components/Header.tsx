@@ -59,7 +59,7 @@ export function Header({
               title={`行情数据更新于 ${formatTime(snapshot.fetchedAt)}（北京时间）`}
             >
               <span className="header-updated__dot" aria-hidden="true" />
-              <span className="header-updated__label">更新</span>
+              <span>更新</span>
               <span>{formatTime(snapshot.fetchedAt)}</span>
             </span>
           )}

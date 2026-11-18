@@ -34,7 +34,7 @@ const LOG_KEY = 'goldwatch.alertlog.v1';
 const SELECTED_KEY = 'goldwatch.selected.v1';
 
 const DEFAULT_SETTINGS: Settings = {
-  theme: 'system',
+  theme: 'dark',
   colorMode: 'cn',
   glass: 'clear',
   sound: true,
@@ -57,7 +57,10 @@ export function loadSettings(): Settings {
   const raw = readJson<Record<string, unknown>>(SETTINGS_KEY);
   if (!raw) return { ...DEFAULT_SETTINGS };
   return {
-    theme: raw.theme === 'light' || raw.theme === 'dark' ? raw.theme : 'system',
+    theme:
+      raw.theme === 'light' || raw.theme === 'dark' || raw.theme === 'system'
+        ? raw.theme
+        : DEFAULT_SETTINGS.theme,
     colorMode: raw.colorMode === 'intl' ? 'intl' : 'cn',
     glass:
       raw.glass === 'classic' || raw.glass === 'vivid' || raw.glass === 'solid'

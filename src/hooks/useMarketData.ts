@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { INSTRUMENT_IDS, type InstrumentId } from '../../shared/instruments';
 import type { HistoryPoint, HistoryResponse, MarketSnapshot, Quote } from '../../shared/types';
+import { apiUrl, hasRemoteApi } from '../lib/api';
 import { mergePoints } from '../lib/history';
 
 export type ConnectionState = 'connecting' | 'live' | 'retrying';
@@ -11,6 +12,7 @@ export interface MarketData {
   history: Record<InstrumentId, HistoryPoint[]>;
   connection: ConnectionState;
   retry: () => void;
+  refresh: () => Promise<void>;
 }
 
 function emptyHistory(): Record<InstrumentId, HistoryPoint[]> {
@@ -29,6 +31,7 @@ export function useMarketData(): MarketData {
   const [connection, setConnection] = useState<ConnectionState>('connecting');
   const [retryKey, setRetryKey] = useState(0);
   const lastDataAtRef = useRef(0);
+  const refreshRef = useRef<() => Promise<void>>(async () => {});
 
   useEffect(() => {
     const startedAt = Date.now();
@@ -63,7 +66,7 @@ export function useMarketData(): MarketData {
 
     async function loadQuotes(): Promise<void> {
       try {
-        const response = await fetch('/api/quotes', {
+        const response = await fetch(apiUrl('/api/quotes'), {
           headers: { Accept: 'application/json' },
           cache: 'no-store',
         });
@@ -80,7 +83,7 @@ export function useMarketData(): MarketData {
 
     async function loadHistory(id: InstrumentId): Promise<void> {
       try {
-        const response = await fetch(`/api/history?id=${encodeURIComponent(id)}`, {
+        const response = await fetch(apiUrl(`/api/history?id=${encodeURIComponent(id)}`), {
           headers: { Accept: 'application/json' },
           cache: 'no-store',
         });
@@ -98,12 +101,17 @@ export function useMarketData(): MarketData {
       void loadQuotes();
       pollTimer = window.setInterval(() => {
         void loadQuotes();
-      }, 10_000);
+      }, hasRemoteApi() ? 5_000 : 10_000);
     }
 
     function connect(): void {
+      // serverless 模式没有 SSE 长连接接口，直接轮询
+      if (hasRemoteApi()) {
+        startPolling();
+        return;
+      }
       try {
-        source = new EventSource('/api/stream');
+        source = new EventSource(apiUrl('/api/stream'));
       } catch {
         setConnection('retrying');
         startPolling();
@@ -129,6 +137,12 @@ export function useMarketData(): MarketData {
       void loadQuotes();
       for (const id of INSTRUMENT_IDS) void loadHistory(id);
     }
+
+    // 供下拉刷新等主动刷新场景调用，不影响现有的 SSE / 轮询连接
+    refreshRef.current = async () => {
+      await loadQuotes();
+      await Promise.all(INSTRUMENT_IDS.map((id) => loadHistory(id)));
+    };
 
     function onVisibilityChange(): void {
       if (document.visibilityState === 'hidden') {
@@ -179,11 +193,13 @@ export function useMarketData(): MarketData {
     setRetryKey((key) => key + 1);
   }, []);
 
+  const refresh = useCallback(() => refreshRef.current(), []);
+
   const quotesById = useMemo(() => {
     const map: Partial<Record<InstrumentId, Quote>> = {};
     for (const quote of snapshot?.quotes ?? []) map[quote.id] = quote;
     return map;
   }, [snapshot]);
 
-  return { snapshot, quotesById, history, connection, retry };
+  return { snapshot, quotesById, history, connection, retry, refresh };
 }

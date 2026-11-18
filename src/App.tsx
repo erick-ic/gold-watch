@@ -8,7 +8,9 @@ import type { Quote } from '../shared/types';
 import { AlertLog } from './components/AlertLog';
 import { ChartPanel } from './components/ChartPanel';
 import { Header } from './components/Header';
+import { LiveClock } from './components/LiveClock';
 import { PriceCard } from './components/PriceCard';
+import { PullToRefresh } from './components/PullToRefresh';
 import { SettingsSheet } from './components/SettingsSheet';
 import { TargetPanel } from './components/TargetPanel';
 import { DataErrorPanel, Toasts, type ToastItem } from './components/Toasts';
@@ -329,6 +331,8 @@ export default function App() {
         onOpenSettings={() => setSettingsOpen(true)}
       />
 
+      <PullToRefresh onRefresh={market.refresh} disabled={settingsOpen} />
+
       <main className="page">
         <div className="container">
           <section className="intro">
@@ -337,7 +341,21 @@ export default function App() {
               <p>追踪伦敦金、上金所与银行积存金报价，自定义目标区间，到价即刻提醒。</p>
             </div>
             <div className="intro-meta" aria-label="行情概览">
-              {snapshot?.usdcny != null && <span>USD/CNY {snapshot.usdcny.toFixed(4)}</span>}
+              <LiveClock className="intro-clock" />
+              {snapshot && (
+                <span
+                  key={snapshot.fetchedAt}
+                  className="update-chip"
+                  aria-label={`行情数据更新于 ${formatTime(snapshot.fetchedAt)}`}
+                  title={`行情数据更新于 ${formatTime(snapshot.fetchedAt)}（北京时间）`}
+                >
+                  <span className="update-chip__dot" aria-hidden="true" />
+                  更新 {formatTime(snapshot.fetchedAt)}
+                </span>
+              )}
+              {snapshot?.usdcny != null && (
+                <span className="intro-fx">USD/CNY {snapshot.usdcny.toFixed(4)}</span>
+              )}
             </div>
           </section>
 
