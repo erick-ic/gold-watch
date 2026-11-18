@@ -74,28 +74,36 @@ export function useMarketData(): MarketData {
       if (fromStream) stopPolling();
     }
 
+    let quotesPromise: Promise<void> | null = null;
     async function loadQuotes(): Promise<void> {
-      try {
-        const response = await fetch(apiUrl('/api/quotes'), {
-          headers: { Accept: 'application/json' },
-          cache: 'no-store',
-        });
-        if (!response.ok) throw await createApiError(response);
-        const data = (await response.json()) as MarketSnapshot;
-        if (!Array.isArray(data?.quotes)) {
-          throw new ApiRequestError({
-            title: '行情数据异常',
-            detail: '接口返回的数据格式不正确，请稍后重试。',
+      // 首屏、主动刷新和轮询共享当前请求，避免慢响应期间叠加请求
+      if (quotesPromise) return quotesPromise;
+      quotesPromise = (async () => {
+        try {
+          const response = await fetch(apiUrl('/api/quotes'), {
+            headers: { Accept: 'application/json' },
+            cache: 'no-store',
           });
+          if (!response.ok) throw await createApiError(response);
+          const data = (await response.json()) as MarketSnapshot;
+          if (!Array.isArray(data?.quotes)) {
+            throw new ApiRequestError({
+              title: '行情数据异常',
+              detail: '接口返回的数据格式不正确，请稍后重试。',
+            });
+          }
+          applySnapshot(data, false);
+        } catch (error) {
+          if (disposed) return;
+          setError(getApiErrorInfo(error));
+          if (Date.now() - lastDataAtRef.current > 15_000) {
+            setConnection('retrying');
+          }
         }
-        applySnapshot(data, false);
-      } catch (error) {
-        if (disposed) return;
-        setError(getApiErrorInfo(error));
-        if (Date.now() - lastDataAtRef.current > 15_000) {
-          setConnection('retrying');
-        }
-      }
+      })().finally(() => {
+        quotesPromise = null;
+      });
+      return quotesPromise;
     }
 
     async function loadHistory(id: InstrumentId): Promise<void> {
@@ -113,9 +121,9 @@ export function useMarketData(): MarketData {
       }
     }
 
-    function startPolling(): void {
+    function startPolling(immediate = true): void {
       if (pollTimer !== undefined) return;
-      void loadQuotes();
+      if (immediate) void loadQuotes();
       pollTimer = window.setInterval(() => {
         void loadQuotes();
       }, hasRemoteApi() ? 5_000 : 10_000);
@@ -124,7 +132,8 @@ export function useMarketData(): MarketData {
     function connect(): void {
       // serverless 模式没有 SSE 长连接接口，直接轮询
       if (hasRemoteApi()) {
-        startPolling();
+        // 首屏请求已在 connect 前发起，这里只启动后续轮询
+        startPolling(false);
         return;
       }
       try {

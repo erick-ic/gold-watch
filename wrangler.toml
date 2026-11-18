@@ -2,8 +2,7 @@ name = "goldwatch-api"
 main = "worker/index.ts"
 compatibility_date = "2025-01-01"
 # server/config.ts 读取 process.env，需要 nodejs 兼容层
-# 允许全局 inFlight Promise 在并发请求间共享，避免已结束请求创建的 Promise 触发 503
-compatibility_flags = ["nodejs_compat", "handle_cross_request_promise_resolution"]
+compatibility_flags = ["nodejs_compat"]
 
 [[kv_namespaces]]
 binding = "PUSH_KV"

@@ -34,6 +34,8 @@ const VAPID_PUB = 'BFLp7IDaSWU1lZKXeWAsM38b1dKajJEZyRW1Bw-lPMTZ1xwyPncXrmfEJ1c4E
 // （Cloudflare Worker 免费版仅 10ms CPU/请求，刷新一次约 8-12ms）
 const CACHE_TTL_MS = 15_000;
 const QUOTE_STALE_MS = 120_000;
+// 主数据源超过该时长未更新时改用备用源（留出缓存与推送间隔的余量）
+const FRESH_MS = 60_000;
 const HISTORY_TTL_MS = 30_000;
 
 // Cron Worker 的行情刷新 TTL（更长，因为 Cron 本身是 30s 一次）
@@ -48,7 +50,6 @@ interface HistoryCacheEntry {
 interface WorkerState {
   snapshot: MarketSnapshot | null;
   fetchedAt: number;
-  inFlight: Promise<MarketSnapshot | null> | null;
   sessionSeries: Map<InstrumentId, HistoryPoint[]>;
   historyCache: Map<InstrumentId, HistoryCacheEntry>;
 }
@@ -57,7 +58,6 @@ interface WorkerState {
 const state: WorkerState = {
   snapshot: null,
   fetchedAt: 0,
-  inFlight: null,
   sessionSeries: new Map(),
   historyCache: new Map(),
 };
@@ -68,9 +68,9 @@ function round2(value: number): number {
 
 async function refreshQuotes(cacheTtlMs = CACHE_TTL_MS): Promise<MarketSnapshot | null> {
   if (state.snapshot && Date.now() - state.fetchedAt < cacheTtlMs) return state.snapshot;
-  if (state.inFlight) return state.inFlight;
 
-  state.inFlight = (async (): Promise<MarketSnapshot | null> => {
+  // 刷新 Promise 仅属于当前请求，不能放入全局 state 供其他请求复用
+  return (async (): Promise<MarketSnapshot | null> => {
     const previous = state.snapshot;
 
     // 并行发起所有上游请求——最大化网络等待重叠
@@ -80,26 +80,39 @@ async function refreshQuotes(cacheTtlMs = CACHE_TTL_MS): Promise<MarketSnapshot 
     const goldApiP = fetchGoldSpotUsd().catch(() => null);
     const usdcnyP = fetchUsdCny().catch(() => null);
 
-    const [sina, eastmoneyQuotes, zheshangQuote, goldPrice, usdcnyResult] = await Promise.all([
-      sinaP, eastmoneyP, zheshangP, goldApiP, usdcnyP,
-    ]);
+    // 主数据源已覆盖全部品种时无需等待备用源，避免被最慢的兜底请求拖住
+    const [sina, zheshangQuote] = await Promise.all([sinaP, zheshangP]);
 
     const quotes = new Map<InstrumentId, Quote>();
-    let usdcny: number | null = usdcnyResult ?? null;
+    let usdcny: number | null = sina?.usdcny ?? null;
 
-    // 新浪
     if (sina) {
       for (const q of sina.quotes) quotes.set(q.id, q);
-      if (usdcny === null) usdcny = sina.usdcny;
     }
-
-    // 东方财富（新浪未覆盖的品种）
-    for (const q of eastmoneyQuotes) {
-      if (!quotes.has(q.id)) quotes.set(q.id, q);
-    }
-
-    // 浙商积存金
     if (zheshangQuote) quotes.set(zheshangQuote.id, zheshangQuote);
+
+    // 新浪偶发停更时也要取备用源，否则该品种会被长期标记为延迟
+    const nowForFresh = Date.now();
+    const needsEastmoney = INSTRUMENT_IDS.some((id) => {
+      if (!hasEastmoneyQuote(id)) return false;
+      const quote = quotes.get(id);
+      if (!quote) return true;
+      return quote.quoteTime === null || nowForFresh - quote.quoteTime > FRESH_MS;
+    });
+    const needsGoldApi = !quotes.has('xauusd');
+    const needsUsdcny = usdcny === null && !quotes.has('au9999');
+    const [eastmoneyQuotes, goldPrice, usdcnyResult] = await Promise.all([
+      needsEastmoney ? eastmoneyP : Promise.resolve([]),
+      needsGoldApi ? goldApiP : Promise.resolve(null),
+      needsUsdcny ? usdcnyP : Promise.resolve(null),
+    ]);
+
+    // 同一品种取时间更新的行情，避免旧数据覆盖新数据
+    for (const q of eastmoneyQuotes) {
+      const existing = quotes.get(q.id);
+      if (!existing || (q.quoteTime ?? 0) > (existing.quoteTime ?? 0)) quotes.set(q.id, q);
+    }
+    if (usdcny === null) usdcny = usdcnyResult ?? null;
 
     // gold-api 兜底 xauusd
     if (!quotes.has('xauusd') && goldPrice !== null) {
@@ -164,11 +177,7 @@ async function refreshQuotes(cacheTtlMs = CACHE_TTL_MS): Promise<MarketSnapshot 
     state.snapshot = snapshot;
     state.fetchedAt = now;
     return snapshot;
-  })().finally(() => {
-    state.inFlight = null;
-  });
-
-  return state.inFlight;
+  })();
 }
 
 async function getHistory(id: InstrumentId, prevClose: number | null) {
