@@ -21,14 +21,20 @@ export const JD_GOLD_HEADERS = {
   Referer: 'https://www.jd.com/',
 } as const;
 
+// Cloudflare Worker 检测：EdgeRuntime 或 caches 全局对象是 Worker 特有
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+const IS_WORKER = typeof (globalThis as any).EdgeRuntime !== 'undefined' || typeof (globalThis as any).caches !== 'undefined';
+
 async function fetchWithTimeout(
   url: string,
   init: RequestInit = {},
   timeoutMs = FETCH_TIMEOUT_MS,
 ): Promise<Response> {
+  // Cloudflare Worker 自带 subrequest 超时，无需额外 AbortSignal（省 CPU 时间）
+  const signal = IS_WORKER ? init.signal : (init.signal ?? AbortSignal.timeout(timeoutMs));
   const response = await fetch(url, {
     ...init,
-    signal: AbortSignal.timeout(timeoutMs),
+    signal,
     headers: { 'Accept-Language': 'zh-CN,zh;q=0.9', ...init.headers },
   });
   if (!response.ok) {

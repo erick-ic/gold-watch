@@ -4,14 +4,13 @@ import { getMarketSession } from '../shared/sessions';
 import { fetchEastmoneyHistory, fetchEastmoneyQuotes, hasEastmoneyQuote } from '../server/data/eastmoney';
 import { fetchZheshangGoldQuote } from '../server/data/jdgold';
 import { fetchGoldSpotUsd, fetchUsdCny } from '../server/data/fallback';
-import { appendSample } from '../server/data/sessionSeries';
 import { fetchSinaSnapshot } from '../server/data/sina';
 
-// 与 server/config.ts 对齐；serverless 下不用 SSE 与限流相关配置
-const CACHE_TTL_MS = 4_000;
+// Worker 环境下 TTL 延长到 15s，避免频繁刷新触发 CPU 超限
+// （Cloudflare Worker 免费版仅 10ms CPU/请求，刷新一次约 8-12ms）
+const CACHE_TTL_MS = 15_000;
 const QUOTE_STALE_MS = 120_000;
 const HISTORY_TTL_MS = 30_000;
-const HISTORY_MAX_POINTS = 900;
 
 interface HistoryCacheEntry {
   points: HistoryPoint[];
@@ -46,96 +45,62 @@ async function refreshQuotes(): Promise<MarketSnapshot | null> {
 
   state.inFlight = (async (): Promise<MarketSnapshot | null> => {
     const previous = state.snapshot;
+
+    // 并行发起所有上游请求——最大化网络等待重叠，避免串行判断的 CPU 开销
+    const sinaP = fetchSinaSnapshot().catch(() => null);
+    const eastmoneyP = fetchEastmoneyQuotes(INSTRUMENT_IDS.filter(hasEastmoneyQuote)).catch(() => []);
+    const zheshangP = fetchZheshangGoldQuote().catch(() => null);
+    const goldApiP = fetchGoldSpotUsd().catch(() => null);
+    const usdcnyP = fetchUsdCny().catch(() => null);
+
+    const [sina, eastmoneyQuotes, zheshangQuote, goldPrice, usdcnyResult] = await Promise.all([
+      sinaP, eastmoneyP, zheshangP, goldApiP, usdcnyP,
+    ]);
+
     const quotes = new Map<InstrumentId, Quote>();
-    let usdcny: number | null = null;
+    let usdcny: number | null = usdcnyResult ?? null;
 
-    try {
-      const sina = await fetchSinaSnapshot();
-      for (const quote of sina.quotes) quotes.set(quote.id, quote);
-      usdcny = sina.usdcny;
-    } catch {
-      // 单个行情源失败时继续尝试其他源
+    // 新浪
+    if (sina) {
+      for (const q of sina.quotes) quotes.set(q.id, q);
+      if (usdcny === null) usdcny = sina.usdcny;
     }
 
-    const missing = INSTRUMENT_IDS.filter((id) => !quotes.has(id) && hasEastmoneyQuote(id));
-    if (missing.length > 0) {
-      try {
-        const eastmoneyQuotes = await fetchEastmoneyQuotes(missing);
-        for (const quote of eastmoneyQuotes) quotes.set(quote.id, quote);
-      } catch {
-        // 同上
-      }
+    // 东方财富（新浪未覆盖的品种）
+    for (const q of eastmoneyQuotes) {
+      if (!quotes.has(q.id)) quotes.set(q.id, q);
     }
 
-    if (!quotes.has('zsjcg')) {
-      try {
-        const quote = await fetchZheshangGoldQuote();
-        if (quote) quotes.set(quote.id, quote);
-      } catch {
-        // 同上
-      }
+    // 浙商积存金
+    if (zheshangQuote) quotes.set(zheshangQuote.id, zheshangQuote);
+
+    // gold-api 兜底 xauusd
+    if (!quotes.has('xauusd') && goldPrice !== null) {
+      quotes.set('xauusd', {
+        id: 'xauusd', price: goldPrice,
+        bid: null, ask: null, prevClose: null, open: null, high: null, low: null,
+        change: null, changePct: null, quoteTime: Date.now(),
+        source: 'gold-api', derived: false, stale: false,
+      });
     }
 
-    if (!quotes.has('xauusd')) {
-      try {
-        const usdPrice = await fetchGoldSpotUsd();
-        if (usdPrice !== null) {
-          quotes.set('xauusd', {
-            id: 'xauusd',
-            price: usdPrice,
-            bid: null,
-            ask: null,
-            prevClose: null,
-            open: null,
-            high: null,
-            low: null,
-            change: null,
-            changePct: null,
-            quoteTime: Date.now(),
-            source: 'gold-api',
-            derived: false,
-            stale: false,
-          });
-        }
-      } catch {
-        // 同上
-      }
-    }
-
-    if (usdcny === null) {
-      try {
-        usdcny = await fetchUsdCny();
-      } catch {
-        // 汇率仅用于参考换算，失败时静默降级
-      }
-    }
-
+    // 沪金衍生换算
     if (!quotes.has('au9999') && usdcny !== null) {
       const xau = quotes.get('xauusd');
       if (xau) {
-        const price = round2((xau.price * usdcny) / TROY_OUNCE_GRAMS);
         quotes.set('au9999', {
-          id: 'au9999',
-          price,
-          bid: null,
-          ask: null,
-          prevClose: null,
-          open: null,
-          high: null,
-          low: null,
-          change: null,
-          changePct: null,
-          quoteTime: Date.now(),
-          source: 'derived',
-          derived: true,
-          stale: false,
+          id: 'au9999', price: round2((xau.price * usdcny) / TROY_OUNCE_GRAMS),
+          bid: null, ask: null, prevClose: null, open: null, high: null, low: null,
+          change: null, changePct: null, quoteTime: Date.now(),
+          source: 'derived', derived: true, stale: false,
         });
       }
     }
 
+    // 缺失品种回退到上一次的快照标记 stale
     for (const id of INSTRUMENT_IDS) {
       if (!quotes.has(id)) {
-        const old = previous?.quotes.find((quote) => quote.id === id);
+        const old = previous?.quotes.find((q) => q.id === id);
         if (old) quotes.set(id, { ...old, stale: true });
       }
     }
@@ -158,26 +123,16 @@ async function refreshQuotes(): Promise<MarketSnapshot | null> {
       return now - quote.quoteTime > QUOTE_STALE_MS ? { ...quote, stale: true } : quote;
     });
 
-    for (const quote of annotatedQuotes) {
-      if (hasEastmoneyQuote(quote.id)) continue;
-      const points = state.sessionSeries.get(quote.id) ?? [];
-      state.sessionSeries.set(
-        quote.id,
-        appendSample(points, { t: quote.quoteTime ?? now, p: quote.price }, HISTORY_MAX_POINTS),
-      );
-    }
+    // Worker 不累积 sessionSeries（跨请求 CPU 成本高），直接跳过采样
+    // （分时历史走 /api/history 接口按需从东财拉取）
 
     const degraded =
       annotatedQuotes.length < INSTRUMENT_IDS.length ||
-      annotatedQuotes.some((quote) => quote.stale) ||
+      annotatedQuotes.some((q) => q.stale) ||
       usdcny === null;
 
     const snapshot: MarketSnapshot = {
-      fetchedAt: now,
-      usdcny,
-      quotes: annotatedQuotes,
-      sessions,
-      degraded,
+      fetchedAt: now, usdcny, quotes: annotatedQuotes, sessions, degraded,
     };
     state.snapshot = snapshot;
     state.fetchedAt = now;
@@ -266,44 +221,51 @@ function json(data: unknown, status = 200): Response {
 
 export default {
   async fetch(request: Request): Promise<Response> {
-    const url = new URL(request.url);
-    if (request.method === 'OPTIONS') return new Response(null, { status: 204, headers: CORS_HEADERS });
-    if (request.method !== 'GET') return json({ error: 'Method Not Allowed' }, 405);
+    try {
+      const url = new URL(request.url);
+      if (request.method === 'OPTIONS') return new Response(null, { status: 204, headers: CORS_HEADERS });
+      if (request.method !== 'GET') return json({ error: 'Method Not Allowed' }, 405);
 
-    if (url.pathname === '/api/quotes') {
-      const snapshot = await refreshQuotes();
-      if (!snapshot) return json({ error: '行情数据尚未就绪，请稍后重试' }, 503);
-      return json(snapshot);
-    }
-
-    if (url.pathname === '/api/history') {
-      const id = url.searchParams.get('id') ?? '';
-      if (!INSTRUMENT_IDS.includes(id as InstrumentId)) {
-        return json({ error: '未知的行情代码' }, 400);
+      if (url.pathname === '/api/quotes') {
+        const snapshot = await refreshQuotes();
+        if (!snapshot) return json({ error: '行情数据尚未就绪，请稍后重试' }, 503);
+        return json(snapshot);
       }
-      const quote = state.snapshot?.quotes.find((item) => item.id === id);
-      return json(await getHistory(id as InstrumentId, quote?.prevClose ?? null));
-    }
 
-    if (url.pathname === '/api/health') {
-      const snapshot = await refreshQuotes();
-      return json({
-        ok: snapshot !== null,
-        uptimeSec: 0,
-        lastSuccessAt: snapshot?.fetchedAt ?? null,
-        lastError: null,
-        clients: 0,
-        sources: {},
-      });
-    }
+      if (url.pathname === '/api/history') {
+        const id = url.searchParams.get('id') ?? '';
+        if (!INSTRUMENT_IDS.includes(id as InstrumentId)) {
+          return json({ error: '未知的行情代码' }, 400);
+        }
+        const quote = state.snapshot?.quotes.find((item) => item.id === id);
+        return json(await getHistory(id as InstrumentId, quote?.prevClose ?? null));
+      }
 
-    if (url.pathname === '/') {
-      return new Response(ROOT_PAGE, {
-        headers: { 'Content-Type': 'text/html; charset=utf-8', ...CORS_HEADERS },
-      });
-    }
+      if (url.pathname === '/api/health') {
+        const snapshot = await refreshQuotes();
+        return json({
+          ok: snapshot !== null,
+          uptimeSec: 0,
+          lastSuccessAt: snapshot?.fetchedAt ?? null,
+          lastError: null,
+          clients: 0,
+          sources: {},
+        });
+      }
 
-    return json({ error: '接口不存在' }, 404);
+      if (url.pathname === '/') {
+        return new Response(ROOT_PAGE, {
+          headers: { 'Content-Type': 'text/html; charset=utf-8', ...CORS_HEADERS },
+        });
+      }
+
+      return json({ error: '接口不存在' }, 404);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      // 保留旧快照（如有），返回 503 而非裸 500，让前端有机会继续显示旧数据
+      if (state.snapshot) return json(state.snapshot);
+      return json({ error: `服务暂时不可用: ${message}` }, 503);
+    }
   },
 };
 
