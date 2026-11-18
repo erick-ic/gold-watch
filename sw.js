@@ -1,4 +1,4 @@
-const CACHE_NAME = 'goldwatch-v1';
+const CACHE_NAME = 'goldwatch-v2';
 
 self.addEventListener('install', (event) => {
   event.waitUntil(
@@ -26,23 +26,32 @@ self.addEventListener('fetch', (event) => {
   if (url.pathname.includes('/api/')) return;
 
   event.respondWith(
-    caches.match(request, { ignoreSearch: true }).then((cached) => {
-      const fetched = fetch(request)
-        .then((response) => {
+    (async () => {
+      // 页面必须优先获取最新 HTML，离线时才使用缓存，避免旧 bundle 长期驻留
+      if (request.mode === 'navigate') {
+        try {
+          const response = await fetch(request);
           if (response.ok) {
-            const clone = response.clone();
-            caches.open(CACHE_NAME).then((cache) => cache.put(request, clone));
+            const cache = await caches.open(CACHE_NAME);
+            await cache.put('./', response.clone());
           }
           return response;
-        })
-        .catch(() => {
-          if (request.mode === 'navigate') {
-            return caches.match('./').then((fallback) => fallback || Response.error());
-          }
+        } catch {
+          const cached = await caches.match('./');
           return cached || Response.error();
-        });
-      return cached || fetched;
-    }),
+        }
+      }
+
+      // 带哈希的静态资源使用缓存优先
+      const cached = await caches.match(request);
+      if (cached) return cached;
+      const response = await fetch(request);
+      if (response.ok) {
+        const cache = await caches.open(CACHE_NAME);
+        await cache.put(request, response.clone());
+      }
+      return response;
+    })(),
   );
 });
 
