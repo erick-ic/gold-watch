@@ -51,11 +51,31 @@ self.addEventListener('fetch', (event) => {
 // =============================================================
 
 self.addEventListener('push', (event) => {
-  // event.data 已经是浏览器解密后的 PushMessageData
-  const data = event.data?.json?.() ?? null;
-  if (!data || typeof data !== 'object') return;
+  console.log('[SW] push 事件收到！event.data =', event.data);
+  let data = null;
+  try {
+    data = event.data?.json?.() ?? null;
+    console.log('[SW] 解析后的 push data:', data);
+  } catch (e) {
+    console.error('[SW] event.data.json() 失败:', e);
+  }
+
+  // DevTools 直接测试按钮发来的没有 data，给个默认通知方便调试
+  if (!data || typeof data !== 'object') {
+    console.warn('[SW] 没有有效 data，发送默认通知');
+    event.waitUntil(
+      self.registration.showNotification('GoldWatch DevTools 测试 ✅', {
+        body: '这条是 DevTools 直接触发的——如果看到了说明 SW 没问题',
+        icon: './icons/icon-192.png',
+        silent: false,
+        requireInteraction: true,
+      }).then(() => console.log('[SW] showNotification 成功')).catch((e) => console.error('[SW] showNotification 失败:', e)),
+    );
+    return;
+  }
 
   const { title = 'GoldWatch 到价提醒', body = '', tag } = data;
+  console.log('[SW] 准备显示通知:', { title, body, tag });
 
   event.waitUntil(
     self.registration.showNotification(title, {
@@ -66,7 +86,7 @@ self.addEventListener('push', (event) => {
       silent: false,
       requireInteraction: true,
       data: { url: './' },
-    }),
+    }).then(() => console.log('[SW] showNotification 成功')).catch((e) => console.error('[SW] showNotification 失败:', e)),
   );
 });
 
