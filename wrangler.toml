@@ -2,4 +2,13 @@ name = "goldwatch-api"
 main = "worker/index.ts"
 compatibility_date = "2025-01-01"
 # server/config.ts 读取 process.env，需要 nodejs 兼容层
-compatibility_flags = ["nodejs_compat"]
+# 允许全局 inFlight Promise 在并发请求间共享，避免已结束请求创建的 Promise 触发 503
+compatibility_flags = ["nodejs_compat", "handle_cross_request_promise_resolution"]
+
+[[kv_namespaces]]
+binding = "PUSH_KV"
+id = "f2fabfd5f16d4005989ce14e3fe0fbac"
+
+# 每 30 秒检查一次行情，对开启 Web Push 的用户做服务端到价检测
+[triggers]
+crons = ["*/30 * * * *"]

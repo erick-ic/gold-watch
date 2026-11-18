@@ -13,6 +13,8 @@ interface SettingsSheetProps {
   onClearLog: () => void;
   hasLog: boolean;
   onTestSound: () => void;
+  webPushSupported: boolean;
+  webPushActive: boolean;
 }
 
 const THEME_OPTIONS: Array<{ value: ThemeMode; label: string }> = [
@@ -43,6 +45,8 @@ export function SettingsSheet({
   onClearLog,
   hasLog,
   onTestSound,
+  webPushSupported,
+  webPushActive,
 }: SettingsSheetProps) {
   const dialogRef = useRef<HTMLDialogElement | null>(null);
 
@@ -199,6 +203,21 @@ export function SettingsSheet({
                 }}
               />
             </div>
+            {webPushSupported && (
+              <div className="setting-row">
+                <div className="setting-copy">
+                  <span className="setting-label">后台推送</span>
+                  <span className="setting-desc">
+                    {webPushActive
+                      ? '已开启，浏览器关闭后也能收到到价提醒'
+                      : '随系统通知一同开启，浏览器关闭后仍可推送'}
+                  </span>
+                </div>
+                <span className={`setting-value ${webPushActive ? 'setting-value--ok' : ''}`}>
+                  {webPushActive ? '已连接' : '未连接'}
+                </span>
+              </div>
+            )}
             <div className="setting-row">
               <div className="setting-copy">
                 <span className="setting-label">提醒频率</span>

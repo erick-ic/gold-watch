@@ -1882,6 +1882,10 @@ a.tag:hover {
   white-space: nowrap;
 }
 
+.setting-value--ok {
+  color: var(--accent, #e8c36a);
+}
+
 .sheet-footnote {
   padding: 13px 20px calc(16px + env(safe-area-inset-bottom));
   border-top: 1px solid var(--separator);

@@ -1,7 +1,14 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { INSTRUMENT_IDS, type InstrumentId } from '../../shared/instruments';
 import type { HistoryPoint, HistoryResponse, MarketSnapshot, Quote } from '../../shared/types';
-import { apiUrl, hasRemoteApi } from '../lib/api';
+import {
+  ApiRequestError,
+  apiUrl,
+  createApiError,
+  getApiErrorInfo,
+  hasRemoteApi,
+  type ApiErrorInfo,
+} from '../lib/api';
 import { mergePoints } from '../lib/history';
 
 export type ConnectionState = 'connecting' | 'live' | 'retrying';
@@ -11,6 +18,7 @@ export interface MarketData {
   quotesById: Partial<Record<InstrumentId, Quote>>;
   history: Record<InstrumentId, HistoryPoint[]>;
   connection: ConnectionState;
+  error: ApiErrorInfo | null;
   retry: () => void;
   refresh: () => Promise<void>;
 }
@@ -29,6 +37,7 @@ export function useMarketData(): MarketData {
   const [snapshot, setSnapshot] = useState<MarketSnapshot | null>(null);
   const [history, setHistory] = useState<Record<InstrumentId, HistoryPoint[]>>(emptyHistory);
   const [connection, setConnection] = useState<ConnectionState>('connecting');
+  const [error, setError] = useState<ApiErrorInfo | null>(null);
   const [retryKey, setRetryKey] = useState(0);
   const lastDataAtRef = useRef(0);
   const refreshRef = useRef<() => Promise<void>>(async () => {});
@@ -53,6 +62,7 @@ export function useMarketData(): MarketData {
       setSnapshot(incoming);
       lastDataAtRef.current = Date.now();
       setConnection('live');
+      setError(null);
       setHistory((prev) => {
         const next = { ...prev };
         for (const quote of incoming.quotes) {
@@ -70,12 +80,19 @@ export function useMarketData(): MarketData {
           headers: { Accept: 'application/json' },
           cache: 'no-store',
         });
-        if (!response.ok) throw new Error(`行情接口返回 ${response.status}`);
+        if (!response.ok) throw await createApiError(response);
         const data = (await response.json()) as MarketSnapshot;
-        if (!Array.isArray(data?.quotes)) throw new Error('行情数据格式异常');
+        if (!Array.isArray(data?.quotes)) {
+          throw new ApiRequestError({
+            title: '行情数据异常',
+            detail: '接口返回的数据格式不正确，请稍后重试。',
+          });
+        }
         applySnapshot(data, false);
-      } catch {
-        if (!disposed && Date.now() - lastDataAtRef.current > 15_000) {
+      } catch (error) {
+        if (disposed) return;
+        setError(getApiErrorInfo(error));
+        if (Date.now() - lastDataAtRef.current > 15_000) {
           setConnection('retrying');
         }
       }
@@ -189,6 +206,7 @@ export function useMarketData(): MarketData {
 
   const retry = useCallback(() => {
     lastDataAtRef.current = 0;
+    setError(null);
     setConnection('connecting');
     setRetryKey((key) => key + 1);
   }, []);
@@ -201,5 +219,5 @@ export function useMarketData(): MarketData {
     return map;
   }, [snapshot]);
 
-  return { snapshot, quotesById, history, connection, retry, refresh };
+  return { snapshot, quotesById, history, connection, error, retry, refresh };
 }

@@ -25,6 +25,14 @@ import {
 } from './lib/alerts';
 import { formatPrice, formatRangeLabel, formatTime, uid } from './lib/format';
 import { currentPermission, requestPermission, showSystemNotification } from './lib/notify';
+import {
+  createPushSubscription,
+  getExistingSubscription,
+  pushSupported,
+  subscribePush,
+  unsubscribePush,
+  updatePushTargets,
+} from './lib/push';
 import { playChime, primeAudio } from './lib/sound';
 import {
   loadAlertLog,
@@ -59,10 +67,12 @@ export default function App() {
     () => window.matchMedia('(prefers-color-scheme: dark)').matches,
   );
   const [titleAlert, setTitleAlert] = useState(false);
+  const [webPushActive, setWebPushActive] = useState(false);
 
   const runtimeRef = useRef<Record<InstrumentId, AlertRuntime>>(loadRuntime());
   const lastEvaluatedRef = useRef(0);
   const toastTimers = useRef(new Map<string, number>());
+  const pushSubscriptionRef = useRef<PushSubscription | null>(null);
 
   const effectiveTheme = settings.theme === 'system' ? (systemDark ? 'dark' : 'light') : settings.theme;
 
@@ -173,6 +183,73 @@ export default function App() {
       document.removeEventListener('visibilitychange', onVisibility);
     };
   }, [titleAlert]);
+
+  // === Web Push：组件挂载时检查现有订阅 ===
+  useEffect(() => {
+    if (!pushSupported()) return;
+    getExistingSubscription()
+      .then((sub) => {
+        if (sub) {
+          pushSubscriptionRef.current = sub;
+          setWebPushActive(true);
+        }
+      })
+      .catch(() => {
+        // 忽略：浏览器可能静默拒绝
+      });
+  }, []);
+
+  // === Web Push：targets 变化时同步到 Worker ===
+  useEffect(() => {
+    const sub = pushSubscriptionRef.current;
+    if (!sub) return;
+    updatePushTargets(sub, targets).catch(() => {
+      // 静默：Worker 暂不可达不影响前端
+    });
+  }, [targets]);
+
+  // === Web Push：settings.notifications 变化时自动订阅/注销 ===
+  useEffect(() => {
+    if (!pushSupported()) return;
+    if (settings.notifications && permission === 'granted') {
+      // 开启：先检查是否已有订阅
+      getExistingSubscription()
+        .then(async (existing) => {
+          let sub = existing;
+          if (!sub) {
+            try {
+              sub = await createPushSubscription();
+            } catch {
+              // 用户可能取消了授权请求
+              return;
+            }
+          }
+          if (sub) {
+            pushSubscriptionRef.current = sub;
+            await subscribePush(sub, targets);
+            setWebPushActive(true);
+          }
+        })
+        .catch(() => {
+          // 忽略
+        });
+    } else if (!settings.notifications) {
+      // 关闭：注销
+      const sub = pushSubscriptionRef.current;
+      if (sub) {
+        unsubscribePush(sub).catch(() => { /* 静默 */ });
+        pushSubscriptionRef.current = null;
+        setWebPushActive(false);
+      } else {
+        // 可能浏览器侧有残留订阅但 ref 丢了，也尝试清理
+        getExistingSubscription()
+          .then((existing) => {
+            if (existing) unsubscribePush(existing).catch(() => { /* 静默 */ });
+          })
+          .catch(() => { /* 忽略 */ });
+      }
+    }
+  }, [settings.notifications, permission]);
 
   useEffect(() => {
     const snapshot = market.snapshot;
@@ -362,13 +439,14 @@ export default function App() {
           {showBanner && snapshot && (
             <div className="connection-banner" role="status">
               <span className="connection-banner__dot" aria-hidden="true" />
-              行情连接中断，正在自动重连。当前显示 {formatTime(snapshot.fetchedAt)} 的数据。
+              {market.error?.detail ?? '行情连接中断。'} 正在自动重连，当前显示{' '}
+              {formatTime(snapshot.fetchedAt)} 的数据。
             </div>
           )}
 
           {!snapshot ? (
             market.connection === 'retrying' ? (
-              <DataErrorPanel onRetry={market.retry} />
+              <DataErrorPanel error={market.error} onRetry={market.retry} />
             ) : (
               <LoadingState />
             )
@@ -449,6 +527,8 @@ export default function App() {
         onClearLog={handleClearLog}
         hasLog={alertLog.length > 0}
         onTestSound={testSound}
+        webPushSupported={pushSupported()}
+        webPushActive={webPushActive}
       />
     </div>
   );

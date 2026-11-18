@@ -1,3 +1,4 @@
+import type { ApiErrorInfo } from '../lib/api';
 import { AlertIcon, BellIcon, CloseIcon, InfoIcon } from './Icons';
 
 export interface ToastItem {
@@ -40,14 +41,22 @@ export function Toasts({ items, onDismiss }: ToastsProps) {
   );
 }
 
-export function DataErrorPanel({ onRetry }: { onRetry: () => void }) {
+export function DataErrorPanel({
+  error,
+  onRetry,
+}: {
+  error: ApiErrorInfo | null;
+  onRetry: () => void;
+}) {
   return (
     <div className="panel error-panel" role="alert">
       <span className="error-icon" aria-hidden="true">
         <AlertIcon size={22} />
       </span>
-      <h2>暂时无法获取行情</h2>
-      <p>行情服务连接失败，请检查网络后重试。连接恢复后会自动继续刷新。</p>
+      <h2>{error?.title ?? '暂时无法获取行情'}</h2>
+      <p>
+        {error?.detail ?? '行情服务连接失败，请检查网络后重试。'} 连接恢复后会自动继续刷新。
+      </p>
       <button type="button" className="button button--primary" onClick={onRetry}>
         重新连接
       </button>
