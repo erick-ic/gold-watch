@@ -13,6 +13,9 @@ import { mergePoints } from '../lib/history';
 
 export type ConnectionState = 'connecting' | 'live' | 'retrying';
 
+/** 分时历史拉取失败或降级后的重试间隔 */
+const HISTORY_RETRY_MS = 60_000;
+
 export interface MarketData {
   snapshot: MarketSnapshot | null;
   quotesById: Partial<Record<InstrumentId, Quote>>;
@@ -49,6 +52,10 @@ export function useMarketData(): MarketData {
     let pollTimer: number | undefined;
     let watchdog: number | undefined;
     let hiddenAt = 0;
+    // 记录每个品种分时历史的拉取时间与降级状态，失败后自动重试，
+    // 避免线上偶发的上游超时导致图表整个会话都停留在零散轮询点
+    const historyFetchAt = new Map<InstrumentId, number>();
+    const historyStale = new Map<InstrumentId, boolean>();
 
     function stopPolling(): void {
       if (pollTimer !== undefined) {
@@ -67,11 +74,12 @@ export function useMarketData(): MarketData {
         const next = { ...prev };
         for (const quote of incoming.quotes) {
           const point = { t: quote.quoteTime ?? incoming.fetchedAt, p: quote.price };
-          next[quote.id] = mergePoints(prev[quote.id], [point]);
+          next[quote.id] = mergePoints(prev[quote.id] ?? [], [point]);
         }
         return next;
       });
       if (fromStream) stopPolling();
+      retryStaleHistory();
     }
 
     let quotesPromise: Promise<void> | null = null;
@@ -107,17 +115,36 @@ export function useMarketData(): MarketData {
     }
 
     async function loadHistory(id: InstrumentId): Promise<void> {
+      historyFetchAt.set(id, Date.now());
       try {
         const response = await fetch(apiUrl(`/api/history?id=${encodeURIComponent(id)}`), {
           headers: { Accept: 'application/json' },
           cache: 'no-store',
         });
-        if (!response.ok) return;
+        if (!response.ok) {
+          historyStale.set(id, true);
+          return;
+        }
         const data = (await response.json()) as HistoryResponse;
-        if (disposed || !Array.isArray(data?.points)) return;
-        setHistory((prev) => ({ ...prev, [id]: mergePoints(prev[id], data.points) }));
+        if (disposed || !Array.isArray(data?.points)) {
+          historyStale.set(id, true);
+          return;
+        }
+        historyStale.set(id, data.stale === true);
+        setHistory((prev) => ({ ...prev, [id]: mergePoints(prev[id] ?? [], data.points) }));
       } catch {
+        historyStale.set(id, true);
         // 分时历史缺失时保留会话内采样数据
+      }
+    }
+
+    function retryStaleHistory(): void {
+      const now = Date.now();
+      for (const id of INSTRUMENT_IDS) {
+        if (!historyStale.get(id)) continue;
+        const fetchedAt = historyFetchAt.get(id) ?? 0;
+        if (now - fetchedAt < HISTORY_RETRY_MS) continue;
+        void loadHistory(id);
       }
     }
 

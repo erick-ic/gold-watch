@@ -2,14 +2,15 @@ import { INSTRUMENT_IDS, TROY_OUNCE_GRAMS, type InstrumentId } from '../shared/i
 import type { HistoryPoint, MarketSession, MarketSnapshot, Quote } from '../shared/types';
 import type { PushSubscriptionRecord, PushTargets } from '../shared/push-types';
 import { getMarketSession } from '../shared/sessions';
+import { HISTORY_MAX_POINTS } from '../server/config';
+import { appendSample } from '../server/data/sessionSeries';
 import { fetchEastmoneyHistory, fetchEastmoneyQuotes, hasEastmoneyQuote } from '../server/data/eastmoney';
-import { fetchZheshangGoldQuote } from '../server/data/jdgold';
+import { fetchMinshengGoldQuote, fetchZheshangGoldQuote } from '../server/data/jdgold';
 import { fetchGoldSpotUsd, fetchUsdCny } from '../server/data/fallback';
 import { fetchSinaSnapshot } from '../server/data/sina';
 import {
   evaluateAlertsForSubscription,
   sendWebPush,
-  encryptPushPayload,
   base64UrlToBytes,
 } from './push';
 
@@ -30,12 +31,12 @@ declare global {
 // VAPID 公钥与前端编译时常量保持一致（Base64url Raw 格式）
 const VAPID_PUB = 'BFLp7IDaSWU1lZKXeWAsM38b1dKajJEZyRW1Bw-lPMTZ1xwyPncXrmfEJ1c4EXgVyPNIQ8O5C8LtF2sooPcVrQo';
 
-// Worker 环境下 TTL 延长到 15s，避免频繁刷新触发 CPU 超限
-// （Cloudflare Worker 免费版仅 10ms CPU/请求，刷新一次约 8-12ms）
-const CACHE_TTL_MS = 15_000;
+// Worker 缓存策略：5s TTL + 3s fetch 超时，快速失败快速刷新
+// （刷新本身很快，正常并行 5 源总耗时在 200ms 内；3s 超时够覆盖慢源又不拖垮 Worker）
+const CACHE_TTL_MS = 5_000;
 const QUOTE_STALE_MS = 120_000;
-// 主数据源超过该时长未更新时改用备用源（留出缓存与推送间隔的余量）
-const FRESH_MS = 60_000;
+// 主数据源超过该时长未更新时改用备用源
+const FRESH_MS = 30_000;
 const HISTORY_TTL_MS = 30_000;
 
 // Cron Worker 的行情刷新 TTL（更长，因为 Cron 本身是 30s 一次）
@@ -52,6 +53,8 @@ interface WorkerState {
   fetchedAt: number;
   sessionSeries: Map<InstrumentId, HistoryPoint[]>;
   historyCache: Map<InstrumentId, HistoryCacheEntry>;
+  /** 会话采样写入 Edge Cache 的节流时间 */
+  seriesWriteAt: Map<InstrumentId, number>;
 }
 
 // Worker isolate 内模块级状态跨请求保留，充当快照缓存与分时采样累积器
@@ -60,7 +63,65 @@ const state: WorkerState = {
   fetchedAt: 0,
   sessionSeries: new Map(),
   historyCache: new Map(),
+  seriesWriteAt: new Map(),
 };
+
+// Cloudflare 边缘访问国内行情源偶发失败（本地直连稳定），
+// 用 colo 级 Cache API 保存最近一次成功数据，跨 isolate 共享并在故障时兜底
+const EDGE_HISTORY_ORIGIN = 'https://goldwatch-history.internal';
+const EDGE_HISTORY_TTL_SEC = 6 * 60 * 60;
+const SERIES_EDGE_WRITE_MS = 30_000;
+
+function edgeCache(): Cache | null {
+  // 部分 workers-types 版本未声明 caches.default
+  return (caches as unknown as { default?: Cache }).default ?? null;
+}
+
+async function readEdgeHistory(id: InstrumentId): Promise<HistoryCacheEntry | null> {
+  const cache = edgeCache();
+  if (!cache) return null;
+  try {
+    const hit = await cache.match(new Request(`${EDGE_HISTORY_ORIGIN}/${id}`));
+    if (!hit) return null;
+    const entry = (await hit.json()) as HistoryCacheEntry;
+    return Array.isArray(entry?.points) && entry.points.length > 0 ? entry : null;
+  } catch {
+    return null;
+  }
+}
+
+async function writeEdgeHistory(id: InstrumentId, entry: HistoryCacheEntry): Promise<void> {
+  if (entry.points.length === 0) return;
+  const cache = edgeCache();
+  if (!cache) return;
+  try {
+    await cache.put(
+      new Request(`${EDGE_HISTORY_ORIGIN}/${id}`),
+      new Response(JSON.stringify(entry), {
+        headers: {
+          'Content-Type': 'application/json',
+          'Cache-Control': `max-age=${EDGE_HISTORY_TTL_SEC}`,
+        },
+      }),
+    );
+  } catch {
+    // Edge Cache 仅作兜底，写入失败忽略
+  }
+}
+
+function mergeSeries(
+  base: readonly HistoryPoint[],
+  incoming: readonly HistoryPoint[],
+): HistoryPoint[] {
+  const map = new Map<number, number>();
+  for (const point of [...base, ...incoming]) {
+    if (Number.isFinite(point.t) && Number.isFinite(point.p)) map.set(point.t, point.p);
+  }
+  const merged = [...map.entries()].sort((a, b) => a[0] - b[0]);
+  const trimmed =
+    merged.length > HISTORY_MAX_POINTS ? merged.slice(merged.length - HISTORY_MAX_POINTS) : merged;
+  return trimmed.map(([t, p]) => ({ t, p }));
+}
 
 function round2(value: number): number {
   return Math.round(value * 100) / 100;
@@ -75,13 +136,19 @@ async function refreshQuotes(cacheTtlMs = CACHE_TTL_MS): Promise<MarketSnapshot 
 
     // 并行发起所有上游请求——最大化网络等待重叠
     const sinaP = fetchSinaSnapshot().catch(() => null);
-    const eastmoneyP = fetchEastmoneyQuotes(INSTRUMENT_IDS.filter(hasEastmoneyQuote)).catch(() => []);
+    // 东财报价仅在主源缺失/过旧时才真正发起，避免每轮都请求一个可能不可达的接口
+    let eastmoneyP: Promise<Quote[]> | null = null;
+    const loadEastmoneyQuotes = (): Promise<Quote[]> => {
+      eastmoneyP ??= fetchEastmoneyQuotes(INSTRUMENT_IDS.filter(hasEastmoneyQuote)).catch(() => []);
+      return eastmoneyP;
+    };
     const zheshangP = fetchZheshangGoldQuote().catch(() => null);
+    const minshengP = fetchMinshengGoldQuote().catch(() => null);
     const goldApiP = fetchGoldSpotUsd().catch(() => null);
     const usdcnyP = fetchUsdCny().catch(() => null);
 
     // 主数据源已覆盖全部品种时无需等待备用源，避免被最慢的兜底请求拖住
-    const [sina, zheshangQuote] = await Promise.all([sinaP, zheshangP]);
+    const [sina, zheshangQuote, minshengQuote] = await Promise.all([sinaP, zheshangP, minshengP]);
 
     const quotes = new Map<InstrumentId, Quote>();
     let usdcny: number | null = sina?.usdcny ?? null;
@@ -90,6 +157,7 @@ async function refreshQuotes(cacheTtlMs = CACHE_TTL_MS): Promise<MarketSnapshot 
       for (const q of sina.quotes) quotes.set(q.id, q);
     }
     if (zheshangQuote) quotes.set(zheshangQuote.id, zheshangQuote);
+    if (minshengQuote) quotes.set(minshengQuote.id, minshengQuote);
 
     // 新浪偶发停更时也要取备用源，否则该品种会被长期标记为延迟
     const nowForFresh = Date.now();
@@ -97,12 +165,14 @@ async function refreshQuotes(cacheTtlMs = CACHE_TTL_MS): Promise<MarketSnapshot 
       if (!hasEastmoneyQuote(id)) return false;
       const quote = quotes.get(id);
       if (!quote) return true;
+      // 休市时报价时间天然是旧的，不必因此请求备用源
+      if (getMarketSession(id, nowForFresh).phase !== 'open') return false;
       return quote.quoteTime === null || nowForFresh - quote.quoteTime > FRESH_MS;
     });
     const needsGoldApi = !quotes.has('xauusd');
     const needsUsdcny = usdcny === null && !quotes.has('au9999');
     const [eastmoneyQuotes, goldPrice, usdcnyResult] = await Promise.all([
-      needsEastmoney ? eastmoneyP : Promise.resolve([]),
+      needsEastmoney ? loadEastmoneyQuotes() : Promise.resolve([]),
       needsGoldApi ? goldApiP : Promise.resolve(null),
       needsUsdcny ? usdcnyP : Promise.resolve(null),
     ]);
@@ -163,8 +233,28 @@ async function refreshQuotes(cacheTtlMs = CACHE_TTL_MS): Promise<MarketSnapshot 
       return now - quote.quoteTime > QUOTE_STALE_MS ? { ...quote, stale: true } : quote;
     });
 
-    // Worker 不累积 sessionSeries（跨请求 CPU 成本高），直接跳过采样
-    // （分时历史走 /api/history 接口按需从东财拉取）
+    // 累积会话采样：没有第三方分时接口的品种（如浙商积存金）以及
+    // 东财分时接口失败时的兜底，都依赖这里积累的走势点
+    for (const quote of annotatedQuotes) {
+      if (hasEastmoneyQuote(quote.id)) continue;
+      const points = appendSample(
+        state.sessionSeries.get(quote.id) ?? [],
+        { t: quote.quoteTime ?? now, p: quote.price },
+        HISTORY_MAX_POINTS,
+      );
+      state.sessionSeries.set(quote.id, points);
+
+      // 定期写入 Edge Cache，供其他 isolate 或上游故障时恢复走势
+      const lastWrite = state.seriesWriteAt.get(quote.id) ?? 0;
+      if (points.length >= 2 && now - lastWrite > SERIES_EDGE_WRITE_MS) {
+        state.seriesWriteAt.set(quote.id, now);
+        await writeEdgeHistory(quote.id, {
+          points,
+          prevClose: quote.prevClose ?? previous?.quotes.find((q) => q.id === quote.id)?.prevClose ?? null,
+          fetchedAt: now,
+        });
+      }
+    }
 
     const degraded =
       annotatedQuotes.length < INSTRUMENT_IDS.length ||
@@ -202,6 +292,7 @@ async function getHistory(id: InstrumentId, prevClose: number | null) {
         fetchedAt: Date.now(),
       };
       state.historyCache.set(id, entry);
+      await writeEdgeHistory(id, entry);
       return {
         id,
         prevClose: prevClose ?? history.prevClose,
@@ -226,6 +317,26 @@ async function getHistory(id: InstrumentId, prevClose: number | null) {
     };
   }
 
+  // 上游失败时优先用 Edge Cache 里最近一次成功的数据，避免图表变空
+  const edge = await readEdgeHistory(id);
+  if (edge) {
+    state.historyCache.set(id, edge);
+    if (!hasEastmoneyQuote(id)) {
+      state.sessionSeries.set(
+        id,
+        mergeSeries(state.sessionSeries.get(id) ?? [], edge.points),
+      );
+    }
+    return {
+      id,
+      prevClose: prevClose ?? edge.prevClose,
+      points: edge.points,
+      source: 'eastmoney' as const,
+      fetchedAt: edge.fetchedAt,
+      stale: true,
+    };
+  }
+
   const points = state.sessionSeries.get(id) ?? [];
   return {
     id,
@@ -233,7 +344,8 @@ async function getHistory(id: InstrumentId, prevClose: number | null) {
     points: [...points],
     source: 'session' as const,
     fetchedAt: Date.now(),
-    stale: points.length === 0,
+    // 有东财分时的品种走到这里说明上游失败，标记 stale 让前端稍后重试
+    stale: hasEastmoneyQuote(id) ? true : points.length === 0,
   };
 }
 
@@ -298,8 +410,41 @@ async function handlePushSubscribe(
     return json({ error: 'p256dh / auth 解码失败' }, 400);
   }
 
-  // 构造订阅记录
-  const record: PushSubscriptionRecord = {
+  // 构造订阅记录：已存在时保留 runtime / createdAt
+  // 否则每次页面加载重新 subscribe 都会把到价状态重置，导致重复推送
+  const key = makeKey(endpoint);
+  const existingRaw = await env.PUSH_KV.get(key);
+  let record: PushSubscriptionRecord;
+  if (existingRaw) {
+    try {
+      const existing = JSON.parse(existingRaw) as PushSubscriptionRecord;
+      record = {
+        ...existing,
+        endpoint,
+        p256dh,
+        auth,
+        targets: normalizeTargets(targets),
+        updatedAt: Date.now(),
+      };
+    } catch {
+      record = createNewRecord(endpoint, p256dh, auth, targets);
+    }
+  } else {
+    record = createNewRecord(endpoint, p256dh, auth, targets);
+  }
+
+  await env.PUSH_KV.put(key, JSON.stringify(record));
+
+  return json({ ok: true, key });
+}
+
+function createNewRecord(
+  endpoint: string,
+  p256dh: string,
+  auth: string,
+  targets: PushTargets | undefined,
+): PushSubscriptionRecord {
+  return {
     endpoint,
     p256dh,
     auth,
@@ -308,11 +453,6 @@ async function handlePushSubscribe(
     createdAt: Date.now(),
     updatedAt: Date.now(),
   };
-
-  const key = makeKey(endpoint);
-  await env.PUSH_KV.put(key, JSON.stringify(record));
-
-  return json({ ok: true, key });
 }
 
 async function handlePushUpdate(
@@ -386,93 +526,6 @@ function createDefaultRuntime(): Record<InstrumentId, { zone: 'inside' | 'outsid
 }
 
 // =============================================================
-//  手动测试接口：立即发送一条推送，不经过 Cron / KV
-//  curl -X POST https://goldwatch.ichenghub.cn/api/push/test \
-//    -H 'Content-Type: application/json' \
-//    -d '{"endpoint":"...", "p256dh":"...", "auth":"..."}'
-// =============================================================
-
-async function handlePushTest(env: Env, request: Request): Promise<Response> {
-  let body: Record<string, unknown>;
-  try {
-    body = (await request.json()) as Record<string, unknown>;
-  } catch {
-    return json({ error: '请求体必须是 JSON' }, 400);
-  }
-
-  const endpoint = typeof body.endpoint === 'string' ? body.endpoint.trim() : '';
-  const p256dh = typeof body.p256dh === 'string' ? body.p256dh.trim() : '';
-  const auth = typeof body.auth === 'string' ? body.auth.trim() : '';
-  const title = typeof body.title === 'string' ? body.title : 'GoldWatch 测试推送';
-  const customBody = typeof body.body === 'string'
-    ? body.body
-    : '这是一条手动触发的测试推送，Worker 加密链路已验证通过 ✅';
-  const tag = typeof body.tag === 'string' ? body.tag : `gw-test-${Date.now()}`;
-
-  if (!endpoint || !p256dh || !auth) {
-    return json({ error: '缺少 endpoint / p256dh / auth 字段' }, 400);
-  }
-
-  // 简单校验
-  if (!endpoint.startsWith('https://')) {
-    return json({ error: 'endpoint 必须是 https:// 推送端点' }, 400);
-  }
-
-  // 严格长度校验：p256dh base64url 解码后必须是 65 字节 (0x04 + 32 + 32 = P-256 未压缩公钥)
-  // auth base64url 解码后必须是 16 字节
-  function b64uLen(s: string): number {
-    let padded = s.replace(/-/g, '+').replace(/_/g, '/');
-    while (padded.length % 4) padded += '=';
-    return Buffer.from(padded, 'base64').length;
-  }
-  const p256dhBytes = b64uLen(p256dh);
-  const authBytes = b64uLen(auth);
-  if (p256dhBytes !== 65) {
-    return json({ error: `p256dh 长度错误：当前 ${p256dhBytes} 字节，必须 65 字节（P-256 未压缩公钥）。可能是 Console 显示截断了，用 copy() 或直接 fetch 不手动复制` }, 400);
-  }
-  if (authBytes !== 16) {
-    return json({ error: `auth 长度错误：当前 ${authBytes} 字节，必须 16 字节` }, 400);
-  }
-
-  const payload = JSON.stringify({ title, body: customBody, tag });
-  const start = Date.now();
-
-  const result = await sendWebPush(
-    endpoint,
-    env.VAPID_PRIV,
-    VAPID_PUB,
-    'mailto:goldwatch@ichenghub.cn',
-    p256dh,
-    auth,
-    payload,
-  );
-
-  const elapsedMs = Date.now() - start;
-
-  if (result.ok) {
-    return json({
-      ok: true,
-      elapsedMs,
-      endpoint: endpoint.slice(0, 60) + '...',
-      payload: JSON.parse(payload),
-      retryAfter: result.retryAfter,
-      statusCode: result.statusCode,
-    });
-  }
-
-  return json(
-    {
-      ok: false,
-      elapsedMs,
-      error: result.error || '推送服务返回失败，请检查 endpoint / p256dh / auth 是否有效',
-      retryAfter: result.retryAfter,
-      pushStatusCode: result.statusCode,
-    },
-    502,
-  );
-}
-
-// =============================================================
 //  Cron Handler：每 30s 检查行情，遍历订阅推送
 // =============================================================
 
@@ -497,60 +550,44 @@ async function runPushCron(env: CronEnv): Promise<void> {
 
 
     const now = Date.now();
-    const pushes: Array<{
-      record: PushSubscriptionRecord;
-      endpoint: string;
-      key: string;
-      alerts: Array<{ title: string; body: string; tag: string }>;
-    }> = [];
 
-    for (const { record, key } of subscriptions) {
-      const alerts = evaluateAlertsForSubscription(record, snapshot, now);
-      if (alerts.length > 0) {
-        // 一次订阅只推一条通知（取第一个品种的 alert，或合并）
-        const first = alerts[0];
-        pushes.push({
-          record,
-          endpoint: record.endpoint,
-          key,
-          alerts: [{ title: first.title, body: first.body, tag: first.tag }],
-        });
-      } else {
-        // 虽然没有到价，但仍需更新 runtime（zone 变化）
-        await env.PUSH_KV.put(key, JSON.stringify(record));
-      }
-    }
+    // 逐个订阅评估并发推送；同一轮多个品种同时到价时逐条发送，避免只发第一条
+    const outcomes = await Promise.all(
+      subscriptions.map(async ({ record, key }) => {
+        const alerts = evaluateAlertsForSubscription(record, snapshot, now);
+        if (alerts.length === 0) return { record, key, dead: false as const, ok: undefined };
 
-    if (pushes.length === 0) return;
-
-    // 3. 并发发送所有推送
-    const results = await Promise.all(
-      pushes.map(async ({ record, endpoint, key, alerts }) => {
-        const { title, body, tag } = alerts[0];
-        const payload = JSON.stringify({ title, body, tag });
-        const result = await sendWebPush(
-          endpoint,
-          env.VAPID_PRIV,
-          VAPID_PUB,
-          'mailto:goldwatch@ichenghub.cn',
-          record.p256dh,
-          record.auth,
-          payload,
+        const results = await Promise.all(
+          alerts.map((alert) =>
+            sendWebPush(
+              record.endpoint,
+              env.VAPID_PRIV,
+              VAPID_PUB,
+              'mailto:goldwatch@ichenghub.cn',
+              record.p256dh,
+              record.auth,
+              JSON.stringify({ title: alert.title, body: alert.body, tag: alert.tag }),
+            ),
+          ),
         );
-        return { record, key, result };
+
+        const dead = results.some((result) => result.statusCode === 404 || result.statusCode === 410);
+        const ok = results.every((result) => result.ok);
+        for (const result of results) {
+          if (!result.ok && !dead) console.warn('[Cron] 推送失败', result);
+        }
+        return { record, key, dead, ok };
       }),
     );
 
-    // 4. 更新 KV（成功推送后保存 runtime；失败则不存避免丢失 alert 状态）
-    for (const { record, key, result } of results) {
-      (record.runtime as Record<string, unknown>)._lastPushResult = result;
-      if (result.ok) {
-        await env.PUSH_KV.put(key, JSON.stringify(record));
-      } else {
-        // 失败也存一下，保留失败信息
-        await env.PUSH_KV.put(key, JSON.stringify(record));
-        console.warn('[Cron] 推送失败', result);
+    // 成功或无需推送时保存 runtime；临时失败不保存，下一轮重试
+    for (const { record, key, dead, ok } of outcomes) {
+      if (dead) {
+        await env.PUSH_KV.delete(key);
+        console.warn('[Cron] 推送端点已失效，清理订阅', key);
+        continue;
       }
+      if (ok !== false) await env.PUSH_KV.put(key, JSON.stringify(record));
     }
   } catch (e) {
     // Cron 异常吞掉，避免 Cron 重试风暴；但保留错误信息给调试
@@ -562,49 +599,6 @@ async function runPushCron(env: CronEnv): Promise<void> {
       await env.PUSH_KV.put('_cron_last_error', JSON.stringify(errRecord));
     } catch { /* ignore */ }
   }
-}
-
-/** 手动调试版 Cron：返回每条订阅的详细推送结果 */
-async function runPushCronDebug(env: CronEnv): Promise<Record<string, unknown>> {
-  const snapshot = await refreshQuotes(CRON_CACHE_TTL_MS);
-  if (!snapshot) return { error: '行情不可用' };
-
-  const subscriptions = await listAllSubscriptions(env.PUSH_KV);
-  const results: Array<Record<string, unknown>> = [];
-  const now = Date.now();
-
-  for (const { record, key } of subscriptions) {
-    const alerts = evaluateAlertsForSubscription(record, snapshot, now);
-    const alert = alerts[0];
-    const beforeZone = record.runtime.xauusd?.zone;
-
-    const pushResult = alert
-      ? await sendWebPush(
-          record.endpoint,
-          env.VAPID_PRIV,
-          VAPID_PUB,
-          'mailto:goldwatch@ichenghub.cn',
-          record.p256dh,
-          record.auth,
-          JSON.stringify({ title: alert.title, body: alert.body, tag: alert.tag }),
-        )
-      : null;
-
-    results.push({
-      key: key.slice(0, 40) + '...',
-      endpoint: record.endpoint.slice(0, 50) + '...',
-      beforeZone,
-      willTrigger: !!alert,
-      alert: alert ? { title: alert.title, body: alert.body } : null,
-      pushResult,
-    });
-  }
-
-  return {
-    snapshot: { fetchedAt: snapshot.fetchedAt, xauusdPrice: snapshot.quotes.find((q) => q.id === 'xauusd')?.price },
-    subscriptionCount: subscriptions.length,
-    results,
-  };
 }
 
 /** 遍历 KV 中所有订阅者（带 pagination） */
@@ -685,88 +679,6 @@ export default {
           });
         }
 
-        // === 推送路由 ===
-        if (url.pathname === '/api/push/keys') {
-          return json({ vapid: VAPID_PUB });
-        }
-        if (url.pathname === '/api/push/subscriptions') {
-          // 调试接口：列出所有 KV 里的订阅
-          const subs = await listAllSubscriptions(env.PUSH_KV);
-          return json({
-            count: subs.length,
-            subscriptions: subs.map(({ record, key }) => ({
-              key,
-              endpoint: record.endpoint.slice(0, 60) + '...',
-              p256dhLen: record.p256dh.length,
-              authLen: record.auth.length,
-              targets: record.targets,
-              runtime: Object.fromEntries(
-                Object.entries(record.runtime).map(([id, r]) => [id, { zone: r.zone, lastTriggeredAt: r.lastTriggeredAt }]),
-              ),
-            })),
-          });
-        }
-        if (url.pathname === '/api/push/first-subscription') {
-          // 调试接口：返回第一条订阅的完整 endpoint/p256dh/auth（用于本地 web-push 对照测试）
-          const subs = await listAllSubscriptions(env.PUSH_KV);
-          if (subs.length === 0) return json({ error: '无订阅' }, 404);
-          const s = subs[0];
-          return json({
-            endpoint: s.record.endpoint,
-            p256dh: s.record.p256dh,
-            auth: s.record.auth,
-          });
-        }
-        if (url.pathname === '/api/push/encrypt-test') {
-          const subs = await listAllSubscriptions(env.PUSH_KV);
-          if (subs.length === 0) return json({ error: '无订阅' }, 404);
-          const target = url.searchParams.get('target') ?? 'fcm';
-          const s = subs.find(sub => target === 'fcm' ? sub.record.endpoint.includes('fcm') : !sub.record.endpoint.includes('fcm')) ?? subs[0];
-          const plaintext = url.searchParams.get('payload') ?? JSON.stringify({ title: 'Worker 加密测试', body: '这是 Worker 加密的内容', tag: 'test' });
-          const { encryptedData, debug } = await encryptPushPayload(plaintext, s.record.p256dh, s.record.auth);
-          return json({
-            ok: true,
-            endpoint: s.record.endpoint,
-            p256dh: s.record.p256dh,
-            auth: s.record.auth,
-            plaintext,
-            encryptedBase64: Buffer.from(encryptedData).toString('base64'),
-            encryptedLen: encryptedData.length,
-            debug,
-          });
-        }
-        if (url.pathname === '/api/push/manual-cron') {
-          // 调试接口：手动跑一次 Cron，返回详细结果
-          return json(await runPushCronDebug(env));
-        }
-        if (url.pathname === '/api/push/trigger-cron') {
-          // 调试接口：手动跑一次完整的正式 Cron（含 KV 更新）
-          await runPushCron(env);
-          // 执行后查 subscriptions 看结果
-          const subs = await listAllSubscriptions(env.PUSH_KV);
-          return json({
-            ran: true,
-            subscriptionCount: subs.length,
-            subs: subs.map(({ record }) => ({
-              endpoint: record.endpoint.slice(0, 50) + '...',
-              zone: ((record.runtime as Record<string, unknown>).xauusd as { zone: string } | undefined)?.zone,
-              lpr: (record.runtime as Record<string, unknown>)._lastPushResult ?? null,
-            })),
-          });
-        }
-        if (url.pathname === '/api/push/reset-zones') {
-          // 调试接口：把所有订阅的 zone 重置为 outside，方便重新测试 Cron 触发
-          const subs = await listAllSubscriptions(env.PUSH_KV);
-          for (const { record, key } of subs) {
-            for (const id of INSTRUMENT_IDS) {
-              record.runtime[id] = { zone: 'outside', lastTriggeredAt: 0 };
-            }
-            delete (record.runtime as Record<string, unknown>)._lastPushResult;
-            await env.PUSH_KV.put(key, JSON.stringify(record));
-          }
-          return json({ reset: true, count: subs.length });
-        }
-
         if (url.pathname === '/') {
           return new Response(ROOT_PAGE, {
             headers: { 'Content-Type': 'text/html; charset=utf-8', ...CORS_HEADERS },
@@ -786,9 +698,6 @@ export default {
         }
         if (url.pathname === '/api/push/unsubscribe') {
           return handlePushUnsubscribe(env, request);
-        }
-        if (url.pathname === '/api/push/test') {
-          return handlePushTest(env, request);
         }
         return json({ error: '接口不存在' }, 404);
       }
@@ -864,10 +773,9 @@ const ROOT_PAGE = `<!doctype html>
       <li><code>GET /api/health</code><span>服务状态</span></li>
       <li><code>GET /api/quotes</code><span>实时行情快照</span></li>
       <li><code>GET /api/history?id=…</code><span>当日分时数据</span></li>
-      <li><code>GET /api/push/keys</code><span>Web Push VAPID 公钥</span></li>
       <li><code>POST /api/push/subscribe</code><span>注册推送订阅</span></li>
     </ul>
-    <p class="foot">支持品种：伦敦金 · 沪金99 · 黄金T+D · 浙商积存金</p>
+    <p class="foot">支持品种：伦敦金 · 沪金99 · 黄金T+D · 浙商积存金 · 民生积存金</p>
   </main>
 </body>
 </html>

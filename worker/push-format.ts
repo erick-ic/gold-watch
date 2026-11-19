@@ -1,4 +1,5 @@
 import { INSTRUMENT_MAP, type InstrumentId } from '../shared/instruments';
+import { alertTag } from '../shared/alertTag';
 
 /**
  * 格式化到价推送通知
@@ -17,7 +18,7 @@ export function formatPushNotification(
 
   const title = '金价到达目标区间';
   const body = `${meta.name} ${priceStr} ${meta.unitLabel}，目标 ${rangeStr}`;
-  const tag = `goldwatch-${instrument}-${Math.floor(price)}`;
+  const tag = alertTag(instrument);
 
   return { title, body, tag };
 }
@@ -32,8 +33,4 @@ function formatBounds(
   if (bounds.low !== null) return `≥ ${bounds.low.toFixed(decimals)}`;
   if (bounds.high !== null) return `≤ ${bounds.high.toFixed(decimals)}`;
   return '';
-}
-
-export function formatPriceValue(price: number, decimals: number): string {
-  return price.toFixed(decimals);
 }

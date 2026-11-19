@@ -1,6 +1,6 @@
 export const TROY_OUNCE_GRAMS = 31.1034768;
 
-export type InstrumentId = 'xauusd' | 'au9999' | 'autd' | 'zsjcg';
+export type InstrumentId = 'xauusd' | 'au9999' | 'autd' | 'zsjcg' | 'msjcg';
 type Currency = 'USD' | 'CNY';
 
 export interface InstrumentMeta {
@@ -58,6 +58,17 @@ export const INSTRUMENTS: readonly InstrumentMeta[] = [
     decimals: 2,
     hasOhlc: false,
   },
+  {
+    id: 'msjcg',
+    symbol: 'MS-JCJ',
+    name: '民生积存金',
+    nameEn: 'Minsheng Gold Accumulation',
+    venue: '民生银行',
+    currency: 'CNY',
+    unitLabel: '元/克',
+    decimals: 2,
+    hasOhlc: false,
+  },
 ];
 
 export const INSTRUMENT_MAP: Record<InstrumentId, InstrumentMeta> = {
@@ -65,10 +76,11 @@ export const INSTRUMENT_MAP: Record<InstrumentId, InstrumentMeta> = {
   au9999: INSTRUMENTS[1],
   autd: INSTRUMENTS[2],
   zsjcg: INSTRUMENTS[3],
+  msjcg: INSTRUMENTS[4],
 };
 
 export const INSTRUMENT_IDS: readonly InstrumentId[] = INSTRUMENTS.map((item) => item.id);
 
 export function isInstrumentId(value: string): value is InstrumentId {
-  return value === 'xauusd' || value === 'au9999' || value === 'autd' || value === 'zsjcg';
+  return value === 'xauusd' || value === 'au9999' || value === 'autd' || value === 'zsjcg' || value === 'msjcg';
 }

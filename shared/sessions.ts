@@ -33,6 +33,7 @@ function zoneClock(timeZone: string, at: number): { day: number; minutes: number
 export function getMarketSession(id: InstrumentId, at = Date.now()): MarketSession {
   if (id === 'xauusd') return londonSession(at);
   if (id === 'zsjcg') return bankGoldSession(at);
+  if (id === 'msjcg') return minshengGoldSession(at);
   return sgeSession(at);
 }
 
@@ -117,6 +118,25 @@ export function bankGoldSession(at: number): MarketSession {
     return { phase: 'break', label: '系统清算', detail: '00:10 恢复交易' };
   }
   return open('交易中', '24 小时交易，每日 23:50–00:10 清算');
+}
+
+/**
+ * 民生积存金（北京时间）：按产品报价时段 00:00–02:00、09:10–23:59，
+ * 其余时间暂停报价；周末休市。节假日以银行公告为准。
+ */
+export function minshengGoldSession(at: number): MarketSession {
+  const { day, minutes } = zoneClock(BEIJING, at);
+
+  if (day === 0 || day === 6) {
+    return closed('休市', '周一 09:10 开盘');
+  }
+  if (minutes < 120) {
+    return open('交易中', '00:00–02:00、09:10–23:59');
+  }
+  if (minutes >= 550) {
+    return open('交易中', '00:00–02:00、09:10–23:59');
+  }
+  return { phase: 'break', label: '暂停报价', detail: '09:10 恢复交易' };
 }
 
 function open(label: string, detail: string): MarketSession {

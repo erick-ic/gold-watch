@@ -59,4 +59,11 @@ describe('parseJdGoldResponse', () => {
     expect(parseJdGoldResponse({ resultData: { datas: { price: '--' } } })).toBeNull();
     expect(parseJdGoldResponse({ resultData: { datas: { price: '' } } })).toBeNull();
   });
+
+  it('supports other bank products via explicit instrument id', () => {
+    const quote = parseJdGoldResponse(SAMPLE, 'msjcg');
+    expect(quote?.id).toBe('msjcg');
+    expect(quote?.price).toBe(828.84);
+    expect(quote?.source).toBe('jd');
+  });
 });

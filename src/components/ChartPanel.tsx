@@ -34,6 +34,7 @@ const SHORT_LABEL: Record<InstrumentId, string> = {
   au9999: '沪金 99',
   autd: '黄金 T+D',
   zsjcg: '浙商金',
+  msjcg: '民生金',
 };
 
 interface ChartPanelProps {

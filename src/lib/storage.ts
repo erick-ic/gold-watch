@@ -10,6 +10,8 @@ export interface Settings {
   colorMode: ColorMode;
   glass: GlassMode;
   sound: boolean;
+  /** 页面内通知：到价时在页面右上角弹出提示 */
+  pageNotifications: boolean;
   notifications: boolean;
 }
 
@@ -38,6 +40,7 @@ const DEFAULT_SETTINGS: Settings = {
   colorMode: 'cn',
   glass: 'clear',
   sound: true,
+  pageNotifications: true,
   notifications: true,
 };
 
@@ -67,6 +70,10 @@ export function loadSettings(): Settings {
         ? raw.glass
         : 'clear',
     sound: typeof raw.sound === 'boolean' ? raw.sound : DEFAULT_SETTINGS.sound,
+    pageNotifications:
+      typeof raw.pageNotifications === 'boolean'
+        ? raw.pageNotifications
+        : DEFAULT_SETTINGS.pageNotifications,
     notifications:
       typeof raw.notifications === 'boolean' ? raw.notifications : DEFAULT_SETTINGS.notifications,
   };
@@ -149,6 +156,17 @@ export function loadAlertLog(): AlertLogEntry[] {
 
 export function saveAlertLog(entries: AlertLogEntry[]): void {
   writeJson(LOG_KEY, entries.slice(0, 20));
+}
+
+/** 提醒记录在 localStorage 中实际占用的字节数（用于清理时展示） */
+export function getAlertLogStorageBytes(): number {
+  try {
+    const raw = localStorage.getItem(LOG_KEY);
+    if (!raw) return 0;
+    return new TextEncoder().encode(raw).length;
+  } catch {
+    return 0;
+  }
 }
 
 export function loadSelectedInstrument(): InstrumentId {

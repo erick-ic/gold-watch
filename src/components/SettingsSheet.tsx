@@ -1,4 +1,5 @@
 import { useEffect, useRef } from 'react';
+import { formatBytes } from '../lib/format';
 import type { ColorMode, GlassMode, Settings, ThemeMode } from '../lib/storage';
 import { CloseIcon } from './Icons';
 import { Switch } from './Switch';
@@ -12,6 +13,8 @@ interface SettingsSheetProps {
   onRequestNotifications: () => Promise<boolean>;
   onClearLog: () => void;
   hasLog: boolean;
+  logCount: number;
+  logBytes: number;
   onTestSound: () => void;
   webPushSupported: boolean;
   webPushActive: boolean;
@@ -44,6 +47,8 @@ export function SettingsSheet({
   onRequestNotifications,
   onClearLog,
   hasLog,
+  logCount,
+  logBytes,
   onTestSound,
   webPushSupported,
   webPushActive,
@@ -191,6 +196,17 @@ export function SettingsSheet({
             </div>
             <div className="setting-row">
               <div className="setting-copy">
+                <span className="setting-label">页面内通知</span>
+                <span className="setting-desc">到价时在页面右上角弹出提示</span>
+              </div>
+              <Switch
+                checked={settings.pageNotifications}
+                label="页面内通知"
+                onChange={(checked) => onChange({ ...settings, pageNotifications: checked })}
+              />
+            </div>
+            <div className="setting-row">
+              <div className="setting-copy">
                 <span className="setting-label">系统通知</span>
                 <span className="setting-desc">{permissionText}</span>
               </div>
@@ -234,12 +250,12 @@ export function SettingsSheet({
                 <span className="setting-label">刷新频率</span>
                 <span className="setting-desc">服务端轮询并通过 SSE 实时推送</span>
               </div>
-              <span className="setting-value">5 秒</span>
+              <span className="setting-value">2 秒</span>
             </div>
             <div className="setting-row">
               <div className="setting-copy">
                 <span className="setting-label">行情来源</span>
-                <span className="setting-desc">新浪财经 · 东方财富 · gold-api.com</span>
+                <span className="setting-desc">新浪财经 · 东方财富 · 上金所 · 京东金融</span>
               </div>
             </div>
             <div className="setting-row">
@@ -255,7 +271,10 @@ export function SettingsSheet({
             <div className="setting-row">
               <div className="setting-copy">
                 <span className="setting-label">本地记录</span>
-                <span className="setting-desc">仅保存在当前浏览器，不会上传</span>
+                <span className="setting-desc">
+                  仅保存在当前浏览器，不会上传
+                  {logCount > 0 ? ` · ${logCount} 条 / ${formatBytes(logBytes)}` : ''}
+                </span>
               </div>
               <button
                 type="button"

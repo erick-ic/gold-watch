@@ -1,5 +1,11 @@
 import { describe, expect, it } from 'vitest';
-import { bankGoldSession, getMarketSession, londonSession, sgeSession } from './sessions.js';
+import {
+  bankGoldSession,
+  getMarketSession,
+  londonSession,
+  minshengGoldSession,
+  sgeSession,
+} from './sessions.js';
 
 const at = (iso: string): number => Date.parse(iso);
 
@@ -95,5 +101,29 @@ describe('getMarketSession', () => {
     expect(getMarketSession('au9999', now).phase).toBe('open');
     expect(getMarketSession('autd', now).phase).toBe('open');
     expect(getMarketSession('zsjcg', now).phase).toBe('open');
+    expect(getMarketSession('msjcg', now).phase).toBe('open');
+  });
+});
+
+describe('minshengGoldSession', () => {
+  it('opens during the quoted periods', () => {
+    expect(minshengGoldSession(at('2026-11-17T00:30:00+08:00')).phase).toBe('open');
+    expect(minshengGoldSession(at('2026-11-17T09:10:00+08:00')).phase).toBe('open');
+    expect(minshengGoldSession(at('2026-11-17T23:00:00+08:00')).phase).toBe('open');
+  });
+
+  it('marks the pause between 02:00 and 09:10', () => {
+    expect(minshengGoldSession(at('2026-11-17T03:00:00+08:00'))).toMatchObject({
+      phase: 'break',
+      label: '暂停报价',
+    });
+    expect(minshengGoldSession(at('2026-11-17T09:09:00+08:00')).phase).toBe('break');
+    expect(minshengGoldSession(at('2026-11-17T02:00:00+08:00')).phase).toBe('break');
+  });
+
+  it('closes over the weekend', () => {
+    expect(minshengGoldSession(at('2026-11-21T10:00:00+08:00')).phase).toBe('closed');
+    expect(minshengGoldSession(at('2026-11-22T21:00:00+08:00')).phase).toBe('closed');
+    expect(minshengGoldSession(at('2026-11-23T09:10:00+08:00')).phase).toBe('open');
   });
 });

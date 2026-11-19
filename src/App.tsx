@@ -1,9 +1,10 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   INSTRUMENTS,
   INSTRUMENT_MAP,
   type InstrumentId,
 } from '../shared/instruments';
+import { alertTag } from '../shared/alertTag';
 import type { Quote } from '../shared/types';
 import { AlertLog } from './components/AlertLog';
 import { ChartPanel } from './components/ChartPanel';
@@ -23,8 +24,8 @@ import {
   type TargetBounds,
   type TargetRange,
 } from './lib/alerts';
-import { formatPrice, formatRangeLabel, formatTime, uid } from './lib/format';
-import { currentPermission, requestPermission, showSystemNotification } from './lib/notify';
+import { formatBytes, formatPrice, formatRangeLabel, formatTime, uid } from './lib/format';
+import { currentPermission, requestPermission, showAlertNotification } from './lib/notify';
 import {
   createPushSubscription,
   getExistingSubscription,
@@ -35,6 +36,7 @@ import {
 } from './lib/push';
 import { playChime, primeAudio } from './lib/sound';
 import {
+  getAlertLogStorageBytes,
   loadAlertLog,
   loadRuntime,
   loadSelectedInstrument,
@@ -57,6 +59,7 @@ export default function App() {
   const [settings, setSettings] = useState<Settings>(loadSettings);
   const [targets, setTargets] = useState<Record<InstrumentId, TargetRange>>(loadTargets);
   const [alertLog, setAlertLog] = useState<AlertLogEntry[]>(loadAlertLog);
+  const logBytes = useMemo(() => getAlertLogStorageBytes(), [alertLog]);
   const [selectedId, setSelectedId] = useState<InstrumentId>(loadSelectedInstrument);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [toasts, setToasts] = useState<ToastItem[]>([]);
@@ -113,11 +116,13 @@ export default function App() {
       });
 
       const range = formatRangeLabel(bounds.low, bounds.high, meta.decimals);
-      pushToast({
-        kind: 'alert',
-        title: `${meta.name}进入目标区间`,
-        detail: `现价 ${formatPrice(quote.price, meta.decimals)} ${meta.unitLabel} · 目标 ${range}`,
-      });
+      if (settings.pageNotifications) {
+        pushToast({
+          kind: 'alert',
+          title: `${meta.name}进入目标区间`,
+          detail: `现价 ${formatPrice(quote.price, meta.decimals)} ${meta.unitLabel} · 目标 ${range}`,
+        });
+      }
 
       if (settings.sound) {
         primeAudio();
@@ -126,15 +131,16 @@ export default function App() {
       if (document.visibilityState === 'hidden') {
         setTitleAlert(true);
         if (settings.notifications && permission === 'granted') {
-          showSystemNotification(
+          // 与 Web Push 走同一条展示链路，且共用 tag，避免两条通道各弹一次
+          void showAlertNotification(
             '金价到达目标区间',
             `${meta.name} ${formatPrice(quote.price, meta.decimals)} ${meta.unitLabel}，目标 ${range}。`,
-            `goldwatch-${quote.id}`,
+            alertTag(quote.id),
           );
         }
       }
     },
-    [permission, pushToast, settings.notifications, settings.sound],
+    [permission, pushToast, settings.notifications, settings.pageNotifications, settings.sound],
   );
 
   useEffect(() => {
@@ -342,7 +348,7 @@ export default function App() {
     playChime();
   }, []);
 
-  const handleTestAlert = useCallback(() => {
+  const handleTestAlert = useCallback(async () => {
     primeAudio();
     const quote = market.quotesById[selectedId];
     const meta = INSTRUMENT_MAP[selectedId];
@@ -355,15 +361,70 @@ export default function App() {
       });
       return;
     }
+
     if (settings.sound) playChime();
-    pushToast({
-      kind: 'alert',
-      title: `${meta.name}提醒测试`,
-      detail: bounds
-        ? `当前 ${formatPrice(quote.price, meta.decimals)} ${meta.unitLabel} · 目标 ${formatRangeLabel(bounds.low, bounds.high, meta.decimals)}`
-        : `当前 ${formatPrice(quote.price, meta.decimals)} ${meta.unitLabel}，设置目标区间后将自动提醒。`,
-    });
-  }, [market.quotesById, pushToast, selectedId, settings.sound, targets]);
+
+    const priceText = formatPrice(quote.price, meta.decimals);
+    const range = bounds ? formatRangeLabel(bounds.low, bounds.high, meta.decimals) : null;
+    if (settings.pageNotifications) {
+      pushToast({
+        kind: 'alert',
+        title: `${meta.name}提醒测试`,
+        detail: range
+          ? `当前 ${priceText} ${meta.unitLabel} · 目标 ${range}`
+          : `当前 ${priceText} ${meta.unitLabel}，设置目标区间后将自动提醒。`,
+      });
+    }
+
+    // 与真实到价提醒走同一套系统通知逻辑（含权限申请），只是不受页面可见性限制
+    if (!settings.notifications) {
+      pushToast({
+        kind: 'info',
+        title: '系统通知未开启',
+        detail: '在设置中开启「系统通知」后，测试会同时弹出系统通知。',
+      });
+      return;
+    }
+
+    let granted = permission;
+    if (granted !== 'granted' && granted !== 'denied' && granted !== 'unsupported') {
+      granted = await requestPermission();
+      setPermission(granted);
+    }
+    if (granted !== 'granted') {
+      pushToast({
+        kind: 'info',
+        title: '系统通知不可用',
+        detail:
+          granted === 'denied'
+            ? '浏览器已拒绝通知权限，请在站点设置中允许后重试。'
+            : '当前浏览器或环境不支持系统通知。',
+      });
+      return;
+    }
+
+    const shown = await showAlertNotification(
+      '金价到达目标区间（测试）',
+      `${meta.name} ${priceText} ${meta.unitLabel}${range ? `，目标 ${range}` : ''}。`,
+      `goldwatch-test-${selectedId}-${Date.now()}`,
+    );
+    if (!shown) {
+      pushToast({
+        kind: 'info',
+        title: '系统通知发送失败',
+        detail: '请检查浏览器与系统通知权限，或稍后重试。',
+      });
+    }
+  }, [
+    market.quotesById,
+    permission,
+    pushToast,
+    selectedId,
+    settings.notifications,
+    settings.pageNotifications,
+    settings.sound,
+    targets,
+  ]);
 
   const handleRequestNotifications = useCallback(async (): Promise<boolean> => {
     const result = await requestPermission();
@@ -388,10 +449,16 @@ export default function App() {
   }, [pushToast]);
 
   const handleClearLog = useCallback(() => {
+    const count = alertLog.length;
+    const bytes = getAlertLogStorageBytes();
     setAlertLog([]);
     saveAlertLog([]);
-    pushToast({ kind: 'info', title: '提醒记录已清空', detail: '本地提醒历史已删除。' });
-  }, [pushToast]);
+    pushToast({
+      kind: 'info',
+      title: '提醒记录已清空',
+      detail: `已删除 ${count} 条本地记录，释放 ${formatBytes(bytes)} 存储空间。`,
+    });
+  }, [alertLog.length, pushToast]);
 
   const snapshot = market.snapshot;
   const selectedMeta = INSTRUMENT_MAP[selectedId];
@@ -526,6 +593,8 @@ export default function App() {
         onRequestNotifications={handleRequestNotifications}
         onClearLog={handleClearLog}
         hasLog={alertLog.length > 0}
+        logCount={alertLog.length}
+        logBytes={logBytes}
         onTestSound={testSound}
         webPushSupported={pushSupported()}
         webPushActive={webPushActive}
@@ -538,8 +607,8 @@ function LoadingState() {
   return (
     <>
       <div className="market-grid" aria-hidden="true">
-        {[0, 1, 2, 3].map((index) => (
-          <div key={index} className="panel skeleton-card">
+        {INSTRUMENTS.map((instrument) => (
+          <div key={instrument.id} className="panel skeleton-card">
             <div className="skeleton skeleton--line" />
             <div className="skeleton skeleton--price" />
             <div className="skeleton skeleton--spark" />

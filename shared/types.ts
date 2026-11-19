@@ -53,7 +53,7 @@ export interface HistoryResponse {
   id: InstrumentId;
   prevClose: number | null;
   points: HistoryPoint[];
-  source: 'eastmoney' | 'session';
+  source: 'eastmoney' | 'sina' | 'sge' | 'session';
   fetchedAt: number;
   stale: boolean;
 }

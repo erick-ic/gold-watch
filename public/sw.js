@@ -69,33 +69,45 @@ self.addEventListener('push', (event) => {
     console.error('[SW] event.data.json() 失败:', e);
   }
 
-  // DevTools 直接测试按钮发来的没有 data，给个默认通知方便调试
-  if (!data || typeof data !== 'object') {
-    console.warn('[SW] 没有有效 data，发送默认通知');
-    event.waitUntil(
-      self.registration.showNotification('GoldWatch DevTools 测试 ✅', {
-        body: '这条是 DevTools 直接触发的——如果看到了说明 SW 没问题',
+  event.waitUntil(
+    (async () => {
+      // 用户正在查看页面时由页面内的 toast/通知负责提醒，避免同一事件重复弹出
+      // （DevTools 手工测试没有 data，仍然展示，便于排查）
+      if (data && typeof data === 'object') {
+        const clientsList = await self.clients.matchAll({ type: 'window', includeUncontrolled: true });
+        const focused = clientsList.some(
+          (client) => client.focused && client.visibilityState === 'visible',
+        );
+        if (focused) {
+          console.log('[SW] 页面正在前台，跳过系统通知');
+          return;
+        }
+      }
+
+      // DevTools 直接测试按钮发来的没有 data，给个默认通知方便调试
+      if (!data || typeof data !== 'object') {
+        console.warn('[SW] 没有有效 data，发送默认通知');
+        await self.registration.showNotification('GoldWatch DevTools 测试 ✅', {
+          body: '这条是 DevTools 直接触发的——如果看到了说明 SW 没问题',
+          icon: './icons/icon-192.png',
+          silent: false,
+          requireInteraction: true,
+        });
+        return;
+      }
+
+      const { title = 'GoldWatch 到价提醒', body = '', tag } = data;
+      console.log('[SW] 准备显示通知:', { title, body, tag });
+      await self.registration.showNotification(title, {
+        body,
         icon: './icons/icon-192.png',
+        badge: './icons/icon-192.png',
+        tag,
         silent: false,
         requireInteraction: true,
-      }).then(() => console.log('[SW] showNotification 成功')).catch((e) => console.error('[SW] showNotification 失败:', e)),
-    );
-    return;
-  }
-
-  const { title = 'GoldWatch 到价提醒', body = '', tag } = data;
-  console.log('[SW] 准备显示通知:', { title, body, tag });
-
-  event.waitUntil(
-    self.registration.showNotification(title, {
-      body,
-      icon: './icons/icon-192.png',
-      badge: './icons/icon-192.png',
-      tag,
-      silent: false,
-      requireInteraction: true,
-      data: { url: './' },
-    }).then(() => console.log('[SW] showNotification 成功')).catch((e) => console.error('[SW] showNotification 失败:', e)),
+        data: { url: './' },
+      });
+    })().catch((e) => console.error('[SW] showNotification 失败:', e)),
   );
 });
 

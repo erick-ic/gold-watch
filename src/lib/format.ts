@@ -137,6 +137,7 @@ const SOURCE_LINKS: Partial<Record<QuoteSource, Partial<Record<InstrumentId, str
   },
   jd: {
     zsjcg: 'https://m.jdjygold.com/finance-gold/newgold/',
+    msjcg: 'https://m.jdjygold.com/finance-gold/newgold/',
   },
   'gold-api': {
     xauusd: 'https://gold-api.com/',
@@ -145,6 +146,13 @@ const SOURCE_LINKS: Partial<Record<QuoteSource, Partial<Record<InstrumentId, str
 
 export function sourceLink(source: QuoteSource, instrument: InstrumentId): string | undefined {
   return SOURCE_LINKS[source]?.[instrument];
+}
+
+export function formatBytes(bytes: number): string {
+  if (!Number.isFinite(bytes) || bytes <= 0) return '0 B';
+  if (bytes < 1024) return `${Math.round(bytes)} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
 export function uid(): string {

@@ -21,14 +21,3 @@ export interface PushSubscriptionRecord {
 /** 前端上报的 targets（与前端 storage.ts 的 TargetRange 一致，但 Worker 不需要带 React 类型） */
 export type PushTargetRange = { low: number | null; high: number | null; enabled: boolean };
 export type PushTargets = Record<InstrumentId, PushTargetRange>;
-
-/** Web Push 通知载荷 */
-export interface PushNotificationPayload {
-  title: string;
-  body: string;
-  icon?: string;
-  tag?: string;
-  /** 点击通知时跳转的相对路径 */
-  url?: string;
-  data?: Record<string, unknown>;
-}

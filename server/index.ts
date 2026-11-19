@@ -1,7 +1,8 @@
 import express, { type NextFunction, type Request, type Response } from 'express';
+import dns from 'node:dns';
 import fs from 'node:fs';
 import path from 'node:path';
-import { isInstrumentId } from '../shared/instruments.js';
+import { INSTRUMENT_IDS, isInstrumentId } from '../shared/instruments.js';
 import type { HealthResponse, MarketSnapshot } from '../shared/types.js';
 import {
   MAX_SSE_CLIENTS,
@@ -12,6 +13,10 @@ import {
   STALE_AFTER_MS,
 } from './config.js';
 import { getHistory, marketService } from './data/service.js';
+
+// 上游行情源（如东财）存在 AAAA 记录但 IPv6 实际不可达，Node 默认优先 IPv6
+// 会导致约一半请求在 ~40ms 内直接失败；强制 IPv4 优先稳定命中可用链路
+dns.setDefaultResultOrder('ipv4first');
 
 const app = express();
 const startedAt = Date.now();
@@ -79,7 +84,7 @@ app.get('/api/history', rateLimit, async (req, res) => {
     return;
   }
   const quote = marketService.getSnapshot()?.quotes.find((item) => item.id === id);
-  const history = await getHistory(id, quote?.prevClose ?? null);
+  const history = await getHistory(id, quote?.prevClose ?? null, quote?.price ?? null);
   res.setHeader('Cache-Control', 'no-store');
   res.json(history);
 });
@@ -103,6 +108,21 @@ function writeEvent(res: Response, event: string, payload: unknown): void {
   res.write(`event: ${event}\ndata: ${JSON.stringify(payload)}\n\n`);
 }
 
+/** 行情无变化时最多隔多久补推一次，避免前端看门狗误判断线 */
+const SSE_KEEPALIVE_MS = 10_000;
+
+/** 快照签名：价格、报价时间、降级标记与交易时段任一变化才算"有新数据" */
+function snapshotSignature(snapshot: MarketSnapshot): string {
+  const parts = [snapshot.degraded ? '1' : '0', String(snapshot.usdcny ?? '')];
+  for (const quote of snapshot.quotes) {
+    parts.push(`${quote.id}:${quote.price}:${quote.quoteTime ?? ''}:${quote.stale ? 1 : 0}`);
+  }
+  for (const id of INSTRUMENT_IDS) {
+    parts.push(`${id}:${snapshot.sessions[id]?.phase ?? ''}`);
+  }
+  return parts.join('|');
+}
+
 app.get('/api/stream', (req, res) => {
   if (sseClients.size >= MAX_SSE_CLIENTS) {
     res.status(503).json({ error: '实时连接数已达上限' });
@@ -122,10 +142,22 @@ app.get('/api/stream', (req, res) => {
 
   sseClients.add(res);
 
+  // 只在行情真正变化时推送；长时间无变化则按 SSE_KEEPALIVE_MS 补推一次保活
+  let lastSignature = '';
+  let lastSentAt = 0;
+
   const snapshot = marketService.getSnapshot();
-  if (snapshot) writeEvent(res, 'quotes', snapshot);
+  if (snapshot) {
+    lastSignature = snapshotSignature(snapshot);
+    lastSentAt = Date.now();
+    writeEvent(res, 'quotes', snapshot);
+  }
 
   const unsubscribe = marketService.onUpdate((next: MarketSnapshot) => {
+    const signature = snapshotSignature(next);
+    if (signature === lastSignature && Date.now() - lastSentAt < SSE_KEEPALIVE_MS) return;
+    lastSignature = signature;
+    lastSentAt = Date.now();
     writeEvent(res, 'quotes', next);
   });
 

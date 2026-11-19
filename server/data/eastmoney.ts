@@ -1,12 +1,12 @@
 import type { Quote, HistoryPoint } from '../../shared/types.js';
-import type { InstrumentId } from '../../shared/instruments.js';
+import { INSTRUMENT_MAP, type InstrumentId } from '../../shared/instruments.js';
 import {
   EASTMONEY_HEADERS,
   fetchJson,
   positiveOrNull,
   toFiniteNumber,
 } from '../http.js';
-import { HISTORY_MAX_POINTS } from '../config.js';
+import { HISTORY_FETCH_TIMEOUT_MS, HISTORY_MAX_POINTS } from '../config.js';
 import { parseBeijingDateTime } from './sina.js';
 
 const SECID_MAP: Partial<Record<InstrumentId, string>> = {
@@ -99,7 +99,8 @@ export async function fetchEastmoneyQuotes(ids: readonly InstrumentId[]): Promis
     if (result.status === 'fulfilled' && result.value) quotes.push(result.value);
   }
   if (quotes.length === 0 && ids.length > 0) {
-    throw new Error('东方财富行情不可用');
+    const names = ids.map((id) => INSTRUMENT_MAP[id].name).join('、');
+    throw new Error(`东方财富备用源本轮无有效报价：${names}`);
   }
   return quotes;
 }
@@ -110,7 +111,11 @@ export async function fetchEastmoneyHistory(id: InstrumentId): Promise<Eastmoney
   const url =
     `https://push2his.eastmoney.com/api/qt/stock/trends2/get?secid=${encodeURIComponent(secid)}` +
     '&fields1=f1,f2,f3,f4,f5,f6,f7,f8&fields2=f51,f52&iscr=0&ndays=1';
-  const response = await fetchJson<EastmoneyTrendsResponse>(url, { headers: EASTMONEY_HEADERS });
+  const response = await fetchJson<EastmoneyTrendsResponse>(
+    url,
+    { headers: EASTMONEY_HEADERS },
+    HISTORY_FETCH_TIMEOUT_MS,
+  );
   const data = response.data;
   const trends = data?.trends;
   if (!data || !Array.isArray(trends) || trends.length === 0) return null;
